@@ -11,8 +11,10 @@ Overall status: **PARTIAL**.
 The live connection, bounded synchronous query, asynchronous query persistence,
 cross-process query recovery, and detached CSV/JSON exports pass. The export
 fix keeps Beeline in the detached wrapper's foreground and validates the local
-SFTP result atomically. Business reconciliation and representative performance
-remain separate `UNVERIFIED` gates.
+SFTP result atomically. Deterministic lifecycle fault coverage now passes;
+export recovery after a fresh MCP process restart is implemented but currently
+blocked by the Windows stdio pipe environment. Business reconciliation and
+representative performance remain separate `UNVERIFIED` gates.
 
 ## Evidence matrix
 
@@ -21,12 +23,13 @@ remain separate `UNVERIFIED` gates.
 | Local preflight | PASS | `scripts/live_acceptance.py --mode preflight` returned exit code 0. |
 | MCP/SSH/Beeline smoke | PASS | `SELECT 1 AS acceptance_value`, 1 row, `truncated=false`, about 10.3 s. |
 | Async query | PASS | `.acceptance-data/live-20261010-193443-f3704705/results.json`, exit code 0. |
-| Cross-process restart | PASS | `.acceptance-data/live-20261010-193523-f3ba93b0/results.json`, exit code 0. |
+| Cross-process query restart | PASS | `.acceptance-data/live-20261010-193523-f3ba93b0/results.json`, exit code 0. |
+| Cross-process export restart | UNVERIFIED | Expanded runner is implemented; latest rerun was blocked by Windows `WinError 5` creating the MCP stdio pipe. |
 | Detached CSV/JSON export | PASS | `.acceptance-data/live-20261010-195940-ec756bff/results.json`; both formats succeeded and passed local file validation. |
 | Synchronous CSV export control | PASS | `carbon_export`, one bounded row, readable CSV metadata returned. |
 | Authorized table sample | UNVERIFIED | `sdr_nethouse.cloudphone_sales_users_all`, explicit `LIMIT 100`; no native expected output or full-count proof. |
 | Live performance | UNVERIFIED | Constant-query timings are recorded, but no approved baseline/SLA exists. |
-| Local regression | PASS | 28 tests passed; compileall and `git diff --check` passed. |
+| Local regression | PASS | 35 tests passed; compileall and `git diff --check` passed. |
 
 The authorized sample was used only with bounded read-only SQL. Its rows and
 credentials are intentionally not reproduced here.
@@ -39,8 +42,9 @@ credentials are intentionally not reproduced here.
   Beeline in the detached wrapper's foreground with stdin bound to `/dev/null`.
 - Export timeout diagnostics read only a bounded remote log prefix and never
   let oversized logs replace the original timeout result.
-- The live runner now supports `restart`, real exit codes, persisted evidence,
-  status traces, export file validation, and text/structured MCP envelopes.
+- The live runner now supports query+export `restart`, real exit codes,
+  persisted evidence, status traces, export file validation, and
+  text/structured MCP envelopes.
 
 ## Reproduction
 
@@ -59,6 +63,8 @@ Evidence is written under `.acceptance-data/`, which is ignored by Git.
 
 ## Remaining non-blocking gates
 
-No async export blocker remains for the bounded live gate. Business-data
+No async export blocker remains for the bounded live gate. Export restart
+verification is pending a usable Windows MCP stdio subprocess window.
+Business-data
 correctness still needs an approved native expected-output file, and performance
 still needs an approved baseline/SLA and representative workload.

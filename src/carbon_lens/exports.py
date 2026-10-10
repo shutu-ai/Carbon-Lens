@@ -113,6 +113,7 @@ class ExportJobManager:
                     "file_size": None,
                     "truncated": None,
                     "error": None,
+                    "cleanup_warning": None,
                 }
             )
             self._update_job(export_id, status="starting")
@@ -238,44 +239,9 @@ class ExportJobManager:
                 self._update_job(row["export_id"], remote_pid=remote_pid.strip())
                 row = self._get_job(row["export_id"])
 
-            # A remote process can remain in RUNNING or CANCEL_REQUESTED
-            # forever if the scheduler, Beeline, or the SSH-launched wrapper
-            # stops making progress.  Check the deadline before either fast
-            # path so such jobs do not become immortal local records.
-            if self._has_timed_out(row):
-                diagnostic = self._read_remote_log(session, row["remote_dir"])
-                detail = "Remote export did not complete before timeout_seconds"
-                if diagnostic and diagnostic.strip():
-                    detail += f": {diagnostic.strip()[-2000:]}"
-                self._mark_failed(row["export_id"], detail)
-                self._cleanup_remote(session, config, row["remote_dir"])
-                return self._snapshot(self._get_job(row["export_id"]))
-
-            if row["status"] == "cancel_requested":
-                if state == EXPORT_SUCCEEDED:
-                    return self._complete_success(session, config, row)
-                if state == EXPORT_FAILED:
-                    error = session.read_text(self._log_path(row["remote_dir"]), max_bytes=4000) or "Remote export failed"
-                    self._mark_failed(row["export_id"], error.strip()[-4000:])
-                    self._cleanup_remote(session, config, row["remote_dir"])
-                    return self._snapshot(self._get_job(row["export_id"]))
-                if state == EXPORT_CANCELLED:
-                    self._mark_cancelled(row["export_id"])
-                    self._cleanup_remote(session, config, row["remote_dir"])
-                    return self._snapshot(self._get_job(row["export_id"]))
-                return self._snapshot(row)
-
-            if state == EXPORT_RUNNING:
-                if row["status"] in {"queued", "starting"}:
-                    self._update_job(
-                        row["export_id"],
-                        status="running",
-                        started_at=row["created_at"],
-                        started_epoch=row["created_epoch"],
-                    )
-                    row = self._get_job(row["export_id"])
-                return self._snapshot(row)
-
+            # A remote terminal state is authoritative, even if the local
+            # poller arrived after its deadline. Preserve the real remote
+            # outcome instead of converting it into a local timeout race.
             if state == EXPORT_SUCCEEDED:
                 return self._complete_success(session, config, row)
 
@@ -290,6 +256,33 @@ class ExportJobManager:
                 self._cleanup_remote(session, config, row["remote_dir"])
                 return self._snapshot(self._get_job(row["export_id"]))
 
+            # A remote process can remain in RUNNING or CANCEL_REQUESTED
+            # forever if the scheduler, Beeline, or the SSH-launched wrapper
+            # stops making progress. Check the deadline only while the
+            # remote state is non-terminal.
+            if self._has_timed_out(row):
+                diagnostic = self._read_remote_log(session, row["remote_dir"])
+                detail = "Remote export did not complete before timeout_seconds"
+                if diagnostic and diagnostic.strip():
+                    detail += f": {diagnostic.strip()[-2000:]}"
+                self._mark_failed(row["export_id"], detail)
+                self._cleanup_remote(session, config, row["remote_dir"])
+                return self._snapshot(self._get_job(row["export_id"]))
+
+            if row["status"] == "cancel_requested":
+                return self._snapshot(row)
+
+            if state == EXPORT_RUNNING:
+                if row["status"] in {"queued", "starting"}:
+                    self._update_job(
+                        row["export_id"],
+                        status="running",
+                        started_at=row["created_at"],
+                        started_epoch=row["created_epoch"],
+                    )
+                    row = self._get_job(row["export_id"])
+                return self._snapshot(row)
+
             return self._snapshot(row)
 
     def _complete_success(self, session: Any, config: Any, row: sqlite3.Row) -> dict[str, Any]:
@@ -299,6 +292,8 @@ class ExportJobManager:
         self._update_job(row["export_id"], status="downloading", download_status="running", error=None)
         try:
             session.download_file(self._output_path(row["remote_dir"]), remote_part)
+            if remote_part.stat().st_size == 0:
+                raise CarbonLensError("remote export file is empty")
             source_columns, row_count = _csv_summary(remote_part)
             if row["format"] == "csv":
                 columns = source_columns
@@ -335,7 +330,9 @@ class ExportJobManager:
             truncated=truncation,
             error=None,
         )
-        self._cleanup_remote(session, config, row["remote_dir"])
+        cleanup_warning = self._cleanup_remote(session, config, row["remote_dir"])
+        if cleanup_warning:
+            self._update_job(row["export_id"], cleanup_warning=cleanup_warning)
         return self._snapshot(self._get_job(row["export_id"]))
 
     @staticmethod
@@ -357,16 +354,20 @@ class ExportJobManager:
                 target_handle.write("\n]\n")
         return columns, original_columns
 
-    def _cleanup_remote(self, session: Any, config: Any, remote_dir: str) -> None:
+    def _cleanup_remote(self, session: Any, config: Any, remote_dir: str) -> str | None:
         command = build_query_job_cleanup_command(config, remote_dir)
         try:
-            session.run(
+            status, output, error = session.run(
                 command,
                 timeout=30,
                 password=config.root_password if config.run_as_user else "",
             )
-        except Exception:
-            pass
+            if status != 0:
+                detail = (error or output or f"exit code {status}").strip()[-500:]
+                return f"remote cleanup warning: {detail}"
+        except Exception as exc:
+            return f"remote cleanup warning: {type(exc).__name__}: {exc}"
+        return None
 
     def _read_remote_log(self, session: Any, remote_dir: str) -> str | None:
         """Read a bounded log tail without rejecting a large remote log."""
@@ -410,7 +411,8 @@ class ExportJobManager:
                     row_count INTEGER,
                     file_size INTEGER,
                     truncated TEXT,
-                    error TEXT
+                    error TEXT,
+                    cleanup_warning TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_export_jobs_status ON export_jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_export_jobs_created ON export_jobs(created_epoch DESC);
@@ -418,6 +420,7 @@ class ExportJobManager:
             )
             self._ensure_column(conn, "export_jobs", "source_columns_json", "TEXT")
             self._ensure_column(conn, "export_jobs", "truncated", "TEXT")
+            self._ensure_column(conn, "export_jobs", "cleanup_warning", "TEXT")
             conn.commit()
         finally:
             conn.close()
@@ -434,7 +437,7 @@ class ExportJobManager:
             "effective_timeout_seconds", "status", "download_status", "created_at",
             "created_epoch", "started_at", "started_epoch", "finished_at", "finished_epoch",
             "remote_dir", "remote_pid", "local_path", "columns_json", "row_count",
-            "source_columns_json", "file_size", "truncated", "error",
+            "source_columns_json", "file_size", "truncated", "error", "cleanup_warning",
         )
         conn = self._connect_db()
         try:
@@ -450,7 +453,7 @@ class ExportJobManager:
         allowed = {
             "status", "download_status", "started_at", "started_epoch", "finished_at",
             "finished_epoch", "remote_pid", "columns_json", "row_count", "file_size", "error",
-            "source_columns_json", "truncated",
+            "source_columns_json", "truncated", "cleanup_warning",
         }
         if not fields or not set(fields).issubset(allowed):
             raise CarbonLensError("后台导出任务更新字段无效")
@@ -543,6 +546,8 @@ class ExportJobManager:
         }
         if row["error"]:
             snapshot["error"] = row["error"]
+        if row["cleanup_warning"]:
+            snapshot["cleanup_warning"] = row["cleanup_warning"]
         return snapshot
 
     @staticmethod

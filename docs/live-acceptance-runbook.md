@@ -33,10 +33,10 @@ presence metadata. It never records credential values.
 .\.venv\Scripts\python.exe scripts\live_acceptance.py --mode benchmark --connection carbon-prod --repetitions 5
 ```
 
-`restart` starts a persisted query in process A, closes it, then opens process
-B with the same SQLite job database and checks the original ID via status and
-list. `exports` validates both CSV and JSON by default; use `--format csv` or
-`--format json` for an isolated retry.
+`restart` starts a persisted query and CSV export in process A, closes it, then
+opens process B with the same SQLite job database and checks both original IDs
+via status, list, and local file validation. `exports` validates both CSV and
+JSON by default; use `--format csv` or `--format json` for an isolated retry.
 
 All requested checks pass only with exit code `0`. Exit code `1` means an
 actual product or acceptance failure. Exit code `2` means BLOCKED_ENV,

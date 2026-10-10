@@ -249,30 +249,67 @@ def check_error(name: str, exc: Exception) -> dict[str, Any]:
 
 
 async def run_restart(args: argparse.Namespace, config: Path, python: Path, job_db: Path, connection: str) -> list[dict[str, Any]]:
-    started: dict[str, Any]
+    started_query: dict[str, Any]
+    started_export: dict[str, Any]
     client_a = LiveClient(python, config, job_db)
     try:
-        await client_a.__aenter__()
-        started = await client_a.call("carbon_query_start", {"connection": connection, "sql": "SELECT 1 AS acceptance_value", "limit": 1, "timeout_seconds": args.remote_timeout})
+        try:
+            await client_a.__aenter__()
+            started_query = await client_a.call("carbon_query_start", {"connection": connection, "sql": "SELECT 1 AS acceptance_value", "limit": 1, "timeout_seconds": args.remote_timeout})
+            started_export = await client_a.call(
+                "carbon_export_start",
+                {
+                    "connection": connection,
+                    "sql": "SELECT 1 AS acceptance_value",
+                    "format": "csv",
+                    "filename": f"restart-{uuid.uuid4().hex[:8]}.csv",
+                    "limit": 1,
+                    "timeout_seconds": args.remote_timeout,
+                },
+            )
+        except Exception as exc:
+            raise AcceptanceError(f"restart server A start failed: {type(exc).__name__}: {exc}", "BLOCKED_ENV") from exc
     finally:
         await client_a.__aexit__(None, None, None)
-    query_id = started.get("query_id") if isinstance(started, dict) else None
-    if not query_id:
-        raise AcceptanceError("restart check did not receive query_id", "FAIL")
+    # Windows may release the child process' instance lock just after the
+    # stdio context returns. Give the OS a short settling window before the
+    # second MCP process opens the same persisted job database.
+    await asyncio.sleep(1.0)
+    query_id = started_query.get("query_id") if isinstance(started_query, dict) else None
+    export_id = started_export.get("export_id") if isinstance(started_export, dict) else None
+    if not query_id or not export_id:
+        raise AcceptanceError("restart check did not receive query_id and export_id", "FAIL")
     client_b = LiveClient(python, config, job_db)
     try:
-        await client_b.__aenter__()
-        completed, trace = await poll(client_b, "carbon_query_status", "query_id", query_id, args.poll_timeout)
-        listed = await client_b.call("carbon_query_list", {"limit": 100})
+        try:
+            await client_b.__aenter__()
+            completed_query, query_trace = await poll(client_b, "carbon_query_status", "query_id", query_id, args.poll_timeout)
+            completed_export, export_trace = await poll(client_b, "carbon_export_status", "export_id", export_id, args.poll_timeout)
+            listed_queries = await client_b.call("carbon_query_list", {"limit": 100})
+            listed_exports = await client_b.call("carbon_export_list", {"limit": 100})
+        except Exception as exc:
+            raise AcceptanceError(f"restart server B resume failed: {type(exc).__name__}: {exc}", "BLOCKED_ENV") from exc
     finally:
         await client_b.__aexit__(None, None, None)
-    entries = listed.get("jobs", listed.get("items", listed)) if isinstance(listed, dict) else listed
-    ids = {item.get("query_id") for item in entries if isinstance(item, dict)} if isinstance(entries, list) else set()
-    state = str(completed.get("status", "")).lower()
-    return [{
-        "name": "cross-process-query-restart", "status": "PASS" if state in SUCCESS_STATES and query_id in ids else "FAIL",
-        "result": {"query_id": query_id, "status": state, "server_a_closed": True, "server_b_reopened": True, "listed_after_restart": query_id in ids, "trace": trace},
-    }]
+    query_entries = listed_queries.get("jobs", listed_queries.get("items", listed_queries)) if isinstance(listed_queries, dict) else listed_queries
+    export_entries = listed_exports.get("exports", listed_exports.get("items", listed_exports)) if isinstance(listed_exports, dict) else listed_exports
+    query_ids = {item.get("query_id") for item in query_entries if isinstance(item, dict)} if isinstance(query_entries, list) else set()
+    export_ids = {item.get("export_id") for item in export_entries if isinstance(item, dict)} if isinstance(export_entries, list) else set()
+    query_state = str(completed_query.get("status", "")).lower()
+    export_state = str(completed_export.get("status", "")).lower()
+    export_file = validate_export_file(completed_export, "csv") if export_state in SUCCESS_STATES else {}
+    return [
+        {
+            "name": "cross-process-query-restart",
+            "status": "PASS" if query_state in SUCCESS_STATES and query_id in query_ids else "FAIL",
+            "result": {"query_id": query_id, "status": query_state, "server_a_closed": True, "server_b_reopened": True, "listed_after_restart": query_id in query_ids, "trace": query_trace},
+        },
+        {
+            "name": "cross-process-export-restart",
+            "status": "PASS" if export_state in SUCCESS_STATES and export_id in export_ids and export_file else "FAIL",
+            "result": {"export_id": export_id, "status": export_state, "server_a_closed": True, "server_b_reopened": True, "listed_after_restart": export_id in export_ids, "trace": export_trace, "file": export_file, "summary": summarize_export(completed_export)},
+        },
+    ]
 
 
 async def run_live(args: argparse.Namespace, evidence_dir: Path) -> dict[str, Any]:
@@ -400,13 +437,14 @@ def main() -> int:
                 async with LiveClient(Path(args.python).resolve(), Path(args.config).resolve(), evidence_dir / "jobs.sqlite3") as client:
                     return await client.call("carbon_list_connections", {})
             connections = asyncio.run(discover())
+            time.sleep(1.0)
             selected = args.connection or (connections[0].get("name") if connections else None)
             if not selected:
                 raise AcceptanceError("no configured connection", "BLOCKED_ENV")
             evidence["connections"] = [{"name": item.get("name"), "transport": item.get("transport")} for item in connections if isinstance(item, dict)]
             evidence["checks"] = asyncio.run(run_restart(args, Path(args.config).resolve(), Path(args.python).resolve(), evidence_dir / "jobs.sqlite3", selected))
         except Exception as exc:  # noqa: BLE001
-            evidence["checks"].append(check_error("cross-process-query-restart", exc))
+            evidence["checks"].append(check_error("cross-process-query-export-restart", exc))
         evidence["finished_at"] = utc_now()
     else:
         evidence = asyncio.run(run_live(args, evidence_dir))
