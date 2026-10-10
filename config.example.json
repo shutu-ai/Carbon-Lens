@@ -1,0 +1,29 @@
+{
+  "connections": {
+    "carbon-prod": {
+      "carbon_transport": "beeline",
+      "connection_mode": "ssh",
+      "ssh_config": {
+        "hostname": "10.125.189.196",
+        "port": 22,
+        "username": "paas",
+        "password_env": "CARBON_LENS_SSH_PASSWORD",
+        "known_hosts": "keys/known_hosts"
+      },
+      "auto_save_host_key": true,
+      "export_temp_ttl_seconds": 1800,
+      "run_as_user": "root",
+      "root_password_env": "CARBON_LENS_ROOT_PASSWORD",
+      "env_script": "/opt/client/bigdata_env",
+      "beeline_path": "/opt/client/Fiber/bin/fiber-beeline",
+      "beeline_connection": "Carbon_Query_XDR",
+      "principal": "ossuser",
+      "keytab": "/opt/client/keytab/ossuser.keytab",
+      "remote_tmp_dir": "/tmp",
+      "export_dir": "exports",
+      "timeout_seconds": 600,
+      "max_rows": 1000000,
+      "max_output_bytes": 104857600
+    }
+  }
+}

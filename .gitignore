@@ -1,0 +1,21 @@
+config.json
+carbon_lens.json
+keys/
+exports/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.sqlite3
+
+# Local release artifacts may include environment-specific configuration.
+packages/
+
+# Generated indexes, build metadata, and test artifacts.
+.codegraph/
+.codex/
+*.egg-info/
+.lifecycle-test-*/
+.pytest-*/
+pytest-cache-files-*/
+p0.png
