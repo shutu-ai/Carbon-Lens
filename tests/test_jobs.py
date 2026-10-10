@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 import sqlite3
+import time
 import uuid
 
 from carbon_lens.config import ConnectionConfig
@@ -76,6 +77,15 @@ class FakeSession:
         return 0, "", ""
 
 
+class RunningSession(FakeSession):
+    def read_text(self, path: str, max_bytes: int | None = None):
+        if path.endswith("/status"):
+            return "RUNNING\n"
+        if path.endswith("/pid"):
+            return "12345\n"
+        return None
+
+
 def test_query_result_is_persisted_outside_sqlite_and_keeps_duplicate_fields(monkeypatch):
     tmp_path = Path(__file__).resolve().parents[1] / (".test-query-" + uuid.uuid4().hex)
     tmp_path.mkdir(parents=True)
@@ -121,5 +131,26 @@ def test_query_cancel_race_uses_remote_success(monkeypatch):
         completed = manager.status(queued["query_id"])
         assert completed["status"] == "succeeded"
         assert completed["result"]["rows"] == [{"id": "1", "id__2": "2"}]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_running_query_is_failed_after_timeout(monkeypatch):
+    tmp_path = Path(__file__).resolve().parents[1] / (".test-query-timeout-" + uuid.uuid4().hex)
+    tmp_path.mkdir(parents=True)
+    try:
+        service = FakeService(tmp_path)
+        session = RunningSession()
+        monkeypatch.setenv("CARBON_LENS_JOB_DB", str(tmp_path / "jobs.sqlite3"))
+        monkeypatch.setattr("carbon_lens.jobs.connect", lambda config: session)
+
+        manager = QueryJobManager(lambda: service)
+        queued = manager.submit("test", "SELECT 1", limit=1, timeout_seconds=1)
+        manager._update_job(queued["query_id"], started_epoch=time.time() - 1000)
+
+        failed = manager.status(queued["query_id"])
+
+        assert failed["status"] == "failed"
+        assert "did not complete" in failed["error"]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)

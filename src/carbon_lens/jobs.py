@@ -239,6 +239,13 @@ class QueryJobManager:
                 self._update_job(row["query_id"], remote_pid=remote_pid.strip())
                 row = self._get_job(row["query_id"])
 
+            # Do not let a stale RUNNING or CANCEL_REQUESTED state bypass the
+            # local deadline forever when the remote wrapper disappeared.
+            if self._has_timed_out(row):
+                self._mark_failed(row["query_id"], "Remote job status did not complete before timeout_seconds")
+                self._cleanup_remote(session, config, row["remote_dir"])
+                return self._snapshot(self._get_job(row["query_id"]), include_result=False)
+
             if row["status"] == "cancel_requested":
                 if state == QUERY_SUCCEEDED:
                     return self._complete_success(session, config, row)
@@ -275,11 +282,6 @@ class QueryJobManager:
 
             if state == QUERY_CANCELLED:
                 self._mark_cancelled(row["query_id"])
-                return self._snapshot(self._get_job(row["query_id"]), include_result=False)
-
-            if self._has_timed_out(row):
-                self._mark_failed(row["query_id"], "Remote job status did not complete before timeout_seconds")
-                self._cleanup_remote(session, config, row["remote_dir"])
                 return self._snapshot(self._get_job(row["query_id"]), include_result=False)
 
             return self._snapshot(row, include_result=False)

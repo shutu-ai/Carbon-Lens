@@ -353,7 +353,7 @@ def build_export_script(
         + alias
         + " --showHeader=true --silent=true --outputformat=csv2 -f "
         + sql_file
-        + " > "
+        + " < /dev/null > "
         + output_file
         + " 2> "
         + log_file
@@ -412,7 +412,7 @@ def build_export_job_script(
         + alias
         + " --showHeader=true --silent=true --outputformat=csv2 -f "
         + sql_file
-        + " > "
+        + " < /dev/null > "
         + output_file
         + " 2> "
         + log_file
@@ -422,21 +422,12 @@ def build_export_job_script(
             "#!/bin/bash",
             "export TERM=dumb",
             "umask 022",
-            "child_pid=''",
-            "watchdog_pid=''",
-            "cancel_monitor_pid=''",
             "fail() {",
-            "  if [ -n \"${watchdog_pid:-}\" ]; then kill \"$watchdog_pid\" 2>/dev/null || true; fi",
-            "  if [ -n \"${cancel_monitor_pid:-}\" ]; then kill \"$cancel_monitor_pid\" 2>/dev/null || true; fi",
             "  printf '%s\\n' FAILED > " + status_file,
             "  printf '%s\\n' \"$2\" >> " + log_file,
             "  exit \"$1\"",
             "}",
             "cancelled() {",
-            "  if [ -n \"${child_pid:-}\" ]; then kill -TERM \"$child_pid\" 2>/dev/null || true; fi",
-            "  if [ -n \"${child_pid:-}\" ]; then sleep 2; kill -KILL \"$child_pid\" 2>/dev/null || true; fi",
-            "  if [ -n \"${watchdog_pid:-}\" ]; then kill \"$watchdog_pid\" 2>/dev/null || true; fi",
-            "  if [ -n \"${cancel_monitor_pid:-}\" ]; then kill \"$cancel_monitor_pid\" 2>/dev/null || true; fi",
             "  printf '%s\\n' CANCELLED > " + status_file,
             "  printf '%s\\n' 'remote export cancelled' >> " + log_file,
             "  exit 143",
@@ -449,23 +440,9 @@ def build_export_job_script(
             + " >/dev/null 2>&1 < /dev/null &",
             "source " + source + " >/dev/null 2>&1 || fail 20 'environment script failed'",
             "kinit -kt " + keytab + " " + principal + " >> " + log_file + " 2>&1 || fail 21 'kinit failed'",
-            command + " &",
-            "child_pid=$!",
-            "( sleep "
-            + str(export_timeout)
-            + "; if kill -0 \"$child_pid\" 2>/dev/null; then kill -TERM \"$child_pid\" 2>/dev/null || true; sleep 30; if kill -0 \"$child_pid\" 2>/dev/null; then kill -KILL \"$child_pid\" 2>/dev/null || true; fi; printf '%s\\n' 'remote export timeout' >> "
-            + log_file
-            + "; fi; fi ) >/dev/null 2>&1 &",
-            "watchdog_pid=$!",
-            "( while kill -0 \"$child_pid\" 2>/dev/null; do if [ -f "
-            + cancel_file
-            + " ]; then kill -TERM \"$$\" 2>/dev/null || true; break; fi; sleep 1; done ) >/dev/null 2>&1 &",
-            "cancel_monitor_pid=$!",
-            "wait \"$child_pid\"",
+            "if [ -f " + cancel_file + " ]; then cancelled; fi",
+            command,
             "status=$?",
-            "child_pid=''",
-            "if [ -n \"${watchdog_pid:-}\" ]; then kill \"$watchdog_pid\" 2>/dev/null || true; fi",
-            "if [ -n \"${cancel_monitor_pid:-}\" ]; then kill \"$cancel_monitor_pid\" 2>/dev/null || true; fi",
             "if [ \"$status\" -eq 0 ]; then",
             "  chmod 644 " + output_file + " " + log_file + " 2>/dev/null || true",
             "  printf '%s\\n' SUCCEEDED > " + status_file,
@@ -475,8 +452,6 @@ def build_export_job_script(
             "exit \"$status\"",
         ]
     )
-    if config.run_as_user:
-        return "su - " + shlex.quote(config.run_as_user) + " -c " + shlex.quote(script)
     return script
 
 

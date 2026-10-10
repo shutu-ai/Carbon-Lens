@@ -6,6 +6,7 @@ import csv
 from datetime import datetime, timezone
 import json
 import os
+import shlex
 from pathlib import Path
 import sqlite3
 from threading import RLock
@@ -242,7 +243,11 @@ class ExportJobManager:
             # stops making progress.  Check the deadline before either fast
             # path so such jobs do not become immortal local records.
             if self._has_timed_out(row):
-                self._mark_failed(row["export_id"], "Remote export did not complete before timeout_seconds")
+                diagnostic = self._read_remote_log(session, row["remote_dir"])
+                detail = "Remote export did not complete before timeout_seconds"
+                if diagnostic and diagnostic.strip():
+                    detail += f": {diagnostic.strip()[-2000:]}"
+                self._mark_failed(row["export_id"], detail)
                 self._cleanup_remote(session, config, row["remote_dir"])
                 return self._snapshot(self._get_job(row["export_id"]))
 
@@ -362,6 +367,17 @@ class ExportJobManager:
             )
         except Exception:
             pass
+
+    def _read_remote_log(self, session: Any, remote_dir: str) -> str | None:
+        """Read a bounded log tail without rejecting a large remote log."""
+        try:
+            status, output, _ = session.run(
+                "tail -c 4000 -- " + shlex.quote(self._log_path(remote_dir)),
+                timeout=15,
+            )
+            return output if status == 0 else None
+        except Exception:
+            return None
 
     def _init_db(self) -> None:
         conn = self._connect_db()

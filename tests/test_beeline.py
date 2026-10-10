@@ -77,8 +77,9 @@ def test_build_export_job_script_persists_status_and_supports_cancel():
     assert "RUNNING > /tmp/carbon-lens-export-test/status" in script
     assert "SUCCEEDED > /tmp/carbon-lens-export-test/status" in script
     assert "CANCELLED > /tmp/carbon-lens-export-test/status" in script
-    assert "sleep 600" in script
     assert "-f /tmp/carbon-lens-export-test/cancel" in script
+    assert "< /dev/null > /tmp/carbon-lens-export-test/result.csv" in script
+    assert not script.startswith("su - root -c")
 
 
 def test_parse_dsv_is_bounded():
