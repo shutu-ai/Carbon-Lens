@@ -5,6 +5,7 @@ from carbon_lens.beeline import (
     build_export_job_script,
     build_script,
     parse_dsv,
+    rows_as_dicts,
     validate_read_only,
 )
 from carbon_lens.config import ConnectionConfig
@@ -96,3 +97,25 @@ def test_validate_read_only_rejects_writes():
         assert "read-only SQL" in str(exc)
     else:
         raise AssertionError("write SQL was accepted")
+
+
+def test_parse_dsv_preserves_empty_values_and_all_duplicate_columns():
+    output = f"{BEGIN_MARKER}\nid|id|ID|\n1||3|\n|| |\n{END_MARKER}\n"
+    columns, rows, truncated = parse_dsv(output, max_rows=10)
+    assert columns == ["id", "id", "ID", ""]
+    assert rows == [["1", "", "3", ""], ["", "", " ", ""]]
+    assert truncated is False
+    assert rows_as_dicts(columns, rows) == [
+        {"id": "1", "id__2": "", "ID__3": "3", "column_4": ""},
+        {"id": "", "id__2": "", "ID__3": " ", "column_4": ""},
+    ]
+
+
+def test_validate_read_only_rejects_multiple_statements_and_allows_read_only_cte():
+    validate_read_only("WITH sample AS (SELECT 1) SELECT * FROM sample")
+    try:
+        validate_read_only("SELECT 1; DELETE FROM users")
+    except Exception as exc:
+        assert "one SQL statement" in str(exc)
+    else:
+        raise AssertionError("multiple SQL statements were accepted")

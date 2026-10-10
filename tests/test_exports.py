@@ -6,6 +6,7 @@ import uuid
 
 from carbon_lens.config import ConnectionConfig
 from carbon_lens.exports import ExportJobManager
+from carbon_lens.service import _csv_summary
 
 
 def runtime_dir() -> Path:
@@ -85,6 +86,17 @@ class FakeSession:
         return 0, "", ""
 
 
+class FlakyDownloadSession(FakeSession):
+    def __init__(self):
+        self.download_attempts = 0
+
+    def download_file(self, remote_path: str, local_path: str | Path):
+        self.download_attempts += 1
+        if self.download_attempts == 1:
+            raise OSError("simulated interrupted SFTP download")
+        super().download_file(remote_path, local_path)
+
+
 def test_background_export_downloads_after_remote_success(monkeypatch):
     tmp_path = runtime_dir()
     try:
@@ -109,6 +121,47 @@ def test_background_export_downloads_after_remote_success(monkeypatch):
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
+def test_cancel_race_uses_remote_success_and_does_not_fake_cancellation(monkeypatch):
+    tmp_path = runtime_dir()
+    try:
+        service = FakeService(tmp_path)
+        session = FakeSession()
+        monkeypatch.setenv("CARBON_LENS_JOB_DB", str(tmp_path / "jobs.sqlite3"))
+        monkeypatch.setattr("carbon_lens.exports.connect", lambda config: session)
+
+        manager = ExportJobManager(lambda: service)
+        queued = manager.submit("test", "SELECT * FROM demo", limit=5)
+        requested = manager.cancel(queued["export_id"])
+        assert requested["status"] == "cancel_requested"
+
+        completed = manager.status(queued["export_id"])
+        assert completed["status"] == "succeeded"
+        assert completed["download_status"] == "completed"
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_interrupted_download_is_retryable_without_resubmitting_sql(monkeypatch):
+    tmp_path = runtime_dir()
+    try:
+        service = FakeService(tmp_path)
+        session = FlakyDownloadSession()
+        monkeypatch.setenv("CARBON_LENS_JOB_DB", str(tmp_path / "jobs.sqlite3"))
+        monkeypatch.setattr("carbon_lens.exports.connect", lambda config: session)
+
+        manager = ExportJobManager(lambda: service)
+        queued = manager.submit("test", "SELECT * FROM demo", limit=5)
+        first = manager.status(queued["export_id"])
+        assert first["status"] == "downloading"
+        assert first["download_status"] == "failed"
+
+        completed = manager.status(queued["export_id"])
+        assert completed["status"] == "succeeded"
+        assert session.download_attempts == 2
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_background_json_export_is_materialized_without_loading_rows():
     tmp_path = runtime_dir()
     try:
@@ -119,5 +172,36 @@ def test_background_json_export_is_materialized_without_loading_rows():
         ExportJobManager._csv_to_json(source, target)
 
         assert target.read_text(encoding="utf-8") == '[\n{"name": "a", "value": "1"},\n{"name": "b", "value": "2"}\n]\n'
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_json_export_preserves_duplicate_columns():
+    tmp_path = runtime_dir()
+    try:
+        source = tmp_path / "duplicate.csv"
+        target = tmp_path / "duplicate.json"
+        source.write_text("id,id,ID,\n1,2,3,\n", encoding="utf-8")
+
+        columns, original = ExportJobManager._csv_to_json(source, target)
+
+        assert columns == ["id", "id__2", "ID__3", "column_4"]
+        assert original == ["id", "id", "ID", ""]
+        assert target.read_text(encoding="utf-8") == '[\n{"id": "1", "id__2": "2", "ID__3": "3", "column_4": ""}\n]\n'
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_csv_summary_rejects_mismatched_rows():
+    tmp_path = runtime_dir()
+    try:
+        source = tmp_path / "invalid.csv"
+        source.write_text("a,b\n1\n", encoding="utf-8")
+        try:
+            _csv_summary(source)
+        except Exception as exc:
+            assert "different column count" in str(exc)
+        else:
+            raise AssertionError("malformed CSV was accepted")
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)

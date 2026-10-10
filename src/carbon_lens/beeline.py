@@ -8,7 +8,7 @@ import re
 import shlex
 from pathlib import Path
 from threading import Event
-from typing import Iterable
+from typing import Any, Iterable
 
 from .config import CarbonLensError, ConnectionConfig
 
@@ -23,6 +23,19 @@ EXPORT_SUCCEEDED = QUERY_SUCCEEDED
 EXPORT_FAILED = QUERY_FAILED
 EXPORT_CANCELLED = QUERY_CANCELLED
 READ_ONLY = {"SELECT", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "USE"}
+READ_ONLY_WITH_CTE = "WITH"
+WRITE_KEYWORDS = {
+    "ALTER",
+    "CREATE",
+    "DELETE",
+    "DROP",
+    "GRANT",
+    "INSERT",
+    "MERGE",
+    "REVOKE",
+    "TRUNCATE",
+    "UPDATE",
+}
 
 
 def _first_keyword(sql: str) -> str:
@@ -31,16 +44,118 @@ def _first_keyword(sql: str) -> str:
     return match.group(1).upper() if match else ""
 
 
+def _sql_without_comments_and_literals(sql: str) -> str:
+    """Return a conservative lexical view used only by the read-only guard.
+
+    This is deliberately not a SQL parser.  It prevents semicolons or write
+    keywords inside quoted values/comments from being mistaken for commands,
+    while leaving dialect-specific SQL to CarbonData.
+    """
+    result: list[str] = []
+    index = 0
+    length = len(sql)
+    quote = ""
+    while index < length:
+        char = sql[index]
+        next_char = sql[index + 1] if index + 1 < length else ""
+        if quote:
+            if char == quote:
+                if next_char == quote:
+                    result.extend((" ", " "))
+                    index += 2
+                    continue
+                quote = ""
+            result.append(" ")
+            index += 1
+            continue
+        if char in "'\"`":
+            quote = char
+            result.append(" ")
+            index += 1
+            continue
+        if char == "-" and next_char == "-":
+            result.extend((" ", " "))
+            index += 2
+            while index < length and sql[index] != "\n":
+                result.append(" ")
+                index += 1
+            continue
+        if char == "/" and next_char == "*":
+            result.extend((" ", " "))
+            index += 2
+            while index + 1 < length and sql[index : index + 2] != "*/":
+                result.append(" ")
+                index += 1
+            if index + 1 < length:
+                result.extend((" ", " "))
+                index += 2
+            continue
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def _has_multiple_statements(sql: str) -> bool:
+    lexical = _sql_without_comments_and_literals(sql)
+    statements = [part.strip() for part in lexical.split(";")]
+    return len([part for part in statements if part]) > 1
+
+
 def validate_read_only(sql: str) -> None:
     if not sql or not sql.strip():
         raise CarbonLensError("SQL cannot be empty")
     if "\x00" in sql:
         raise CarbonLensError("SQL contains a NUL character")
     keyword = _first_keyword(sql)
+    lexical = _sql_without_comments_and_literals(sql)
+    if _has_multiple_statements(sql):
+        raise CarbonLensError("CarbonLens only accepts one SQL statement per call")
+    if keyword == READ_ONLY_WITH_CTE:
+        if re.search(r"(?i)\b(?:" + "|".join(sorted(WRITE_KEYWORDS)) + r")\b", lexical):
+            raise CarbonLensError("CarbonLens only allows read-only SQL; CTE contains a write operation")
+        if not re.search(r"(?i)\bSELECT\b", lexical):
+            raise CarbonLensError("CarbonLens only allows read-only SQL; WITH must contain a SELECT")
+        return
     if keyword not in READ_ONLY:
         raise CarbonLensError(
             f"CarbonLens only allows read-only SQL (SELECT/SHOW/DESCRIBE/EXPLAIN/USE); received: {keyword or '<unknown>'}"
         )
+
+
+def is_row_returning_sql(sql: str) -> bool:
+    """Whether a read-only statement can safely be bounded by an outer LIMIT."""
+    return _first_keyword(sql) in {"SELECT", READ_ONLY_WITH_CTE}
+
+
+def unique_columns(columns: list[str]) -> tuple[list[str], list[str], dict[str, str]]:
+    """Make result keys deterministic without discarding duplicate fields."""
+    normalized: list[str] = []
+    original = list(columns)
+    mapping: dict[str, str] = {}
+    used: set[str] = set()
+    next_suffix: dict[str, int] = {}
+    for index, raw_name in enumerate(columns, start=1):
+        name = str(raw_name)
+        base = name if name else f"column_{index}"
+        candidate = base
+        suffix = next_suffix.get(base.casefold(), 1)
+        while candidate.casefold() in used:
+            suffix += 1
+            candidate = f"{base}__{suffix}"
+        next_suffix[base.casefold()] = suffix
+        used.add(candidate.casefold())
+        normalized.append(candidate)
+        mapping[candidate] = name
+    return normalized, original, mapping
+
+
+def rows_as_dicts(
+    columns: list[str],
+    rows: list[list[str]],
+    normalized_columns: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    normalized = normalized_columns or unique_columns(columns)[0]
+    return [dict(zip(normalized, row)) for row in rows]
 
 
 def build_script(config: ConnectionConfig, remote_sql_path: str) -> str:
@@ -383,6 +498,8 @@ def _bounded_text(
 
 
 def parse_dsv(output: str, max_rows: int) -> tuple[list[str], list[list[str]], bool]:
+    if max_rows < 1:
+        raise CarbonLensError("max_rows must be at least 1")
     try:
         begin = output.index(BEGIN_MARKER) + len(BEGIN_MARKER)
         end = output.index(END_MARKER, begin)
@@ -392,14 +509,13 @@ def parse_dsv(output: str, max_rows: int) -> tuple[list[str], list[list[str]], b
     payload = output[begin:end].strip("\r\n ")
     if not payload:
         return [], [], False
-    rows = [row for row in csv.reader(io.StringIO(payload), delimiter="|") if any(cell.strip() for cell in row)]
+    rows = [row for row in csv.reader(io.StringIO(payload), delimiter="|") if row]
     if not rows:
         return [], [], False
     columns = rows[0]
     data = rows[1:]
     truncated = len(data) > max_rows
-    data = data[:max_rows]
     for row in data:
         if len(row) != len(columns):
             raise CarbonLensError("fiber-beeline returned rows with a different column count")
-    return columns, data, truncated
+    return columns, data[:max_rows], truncated

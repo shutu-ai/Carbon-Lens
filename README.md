@@ -76,12 +76,22 @@ effective limits, elapsed time, returned row count, and the first three rows.
 `total_row_count` remains null unless the original SQL itself returns a total;
 to expose one, alias the value as `total_row_count` or
 `__carbon_lens_total_row_count`. CarbonLens does not issue an extra `COUNT(*)`.
+Result values remain source text when no schema type metadata is available
+(`type_info_unavailable = true`). Duplicate and empty columns are preserved
+with deterministic keys such as `id`, `id__2`, and `column_3`; the response
+also retains `original_columns` and `column_name_map`. Results report
+`returned_row_count`, `has_more`, and `truncated`; a CSV export that reaches
+its cap reports `truncated = "unknown"` because the cap does not prove source
+exhaustion.
 Use `carbon_query_list` and
 `carbon_query_cancel` to manage jobs. Task metadata is stored in the local
 `.carbon-lens-jobs.sqlite3` database, while the SQL runs in a detached job on
 the Carbon host. A completed result is retained locally for 30 days; the remote job
 directory has a two-day safety TTL. Tasks can be inspected after an MCP restart
-with the same `query_id`.
+with the same `query_id`. The SQLite database stores task metadata and a small
+result summary; completed query rows are written to an adjacent atomic JSON
+result file so list/status metadata does not repeatedly serialize a large
+result into SQLite.
 Set `CARBON_LENS_JOB_DB` to choose another local SQLite path; otherwise the
 database is created beside the configured `config.json`.
 

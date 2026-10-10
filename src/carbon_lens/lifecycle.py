@@ -19,6 +19,26 @@ class InstanceAlreadyRunning(RuntimeError):
 def _pid_exists(pid: int) -> bool:
     if pid <= 1:
         return True
+    if os.name == "nt":
+        # os.kill(pid, 0) can block for an invalid large PID on Windows.
+        # OpenProcess is a bounded kernel query and distinguishes a missing
+        # process from one that exists but is not queryable by this user.
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            process = kernel32.OpenProcess(0x1000, False, int(pid))
+            if process:
+                kernel32.CloseHandle(process)
+                return True
+            error = ctypes.get_last_error()
+            # ERROR_ACCESS_DENIED means the process exists but is not
+            # queryable by this account; only invalid-handle/invalid-PID
+            # errors prove that it is absent.
+            return error not in {6, 87, 1168}
+        except (AttributeError, OSError):
+            # Keep a conservative fallback for unusual Windows runtimes.
+            return True
     try:
         os.kill(pid, 0)
     except PermissionError:

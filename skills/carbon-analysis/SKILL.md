@@ -17,9 +17,8 @@ SSH passwords, private keys, keytabs, or other credentials into the conversation
 2. If the table is unknown, use `carbon_query` with bounded `SHOW DATABASES`,
    `SHOW TABLES`, or `DESCRIBE` SQL. Prefer `carbon_describe` when the table name
    is already known.
-3. Send exactly one read-only SQL statement per tool call. The server currently
-   validates the first SQL keyword, so this instruction is important: never
-   combine statements or append another statement after a read-only one.
+3. Send exactly one read-only SQL statement per tool call. CarbonLens rejects
+   multiple statements and write operations, while allowing read-only CTEs.
 4. For analysis, run a bounded sample query with an explicit SQL `LIMIT` and a
    suitable tool `limit`. `carbon_query` caps returned rows at the smaller of
    the requested limit and the connection's configured `max_rows` (up to the
@@ -38,8 +37,12 @@ SSH passwords, private keys, keytabs, or other credentials into the conversation
    preview. Completed local task records and saved results are retained for 30
    days. `total_row_count` is null unless the original SQL provides it;
    never add an automatic `COUNT(*)` query.
-7. State the connection, table, time filters, row limit, and whether the result
-   was truncated before interpreting results.
+7. State the connection, table, time filters, effective row limit, returned row
+   count, and whether the result was truncated before interpreting results.
+   `total_row_count` is unknown unless the query itself returns an explicitly
+   aliased total. Duplicate or empty result columns are preserved with
+   deterministic keys such as `id`, `id__2`, and `column_3`; inspect
+   `original_columns` and `column_name_map` when the mapping matters.
 8. Use `carbon_export` only when the user requests an export. It supports
    `format` `csv` or `json`, plus `filename`, `limit`, and `timeout_seconds`.
    The effective row cap is the smaller of the requested `limit` and configured
@@ -60,10 +63,10 @@ SSH passwords, private keys, keytabs, or other credentials into the conversation
    It does not itself download the file to the user's computer; do not claim it
    does. If that path is not accessible to the user, state the limitation.
 11. For JSON exports, report `truncated` when true and do not present a capped
-   result as complete. CSV exports are capped by `limit`, but the current
-   implementation reports `truncated: false` even when more matching rows may
-   exist; report the applied row cap and do not treat that field as proof of
-   completeness.
+   result as complete. CSV exports report `truncated: "unknown"` when the
+   bounded result reaches the effective limit, because an exact cap cannot
+   prove that no additional source rows exist. Always report the applied row
+   cap and do not treat an unknown result as complete.
 
 ## Response display format
 
@@ -111,7 +114,7 @@ finished when the status is `queued` or `running`.
 
 #### `carbon_query_status`
 
-- `queued` or `running`: show the ID, status, elapsed time, effective timeout,
+- `queued`, `starting`, or `running`: show the ID, status, elapsed time, effective timeout,
   and a short instruction to poll again. Do not show an empty result table.
 - `cancel_requested`: say `已提交取消请求，等待远程任务确认` and keep polling
   until the status becomes `cancelled` or another terminal state.

@@ -11,15 +11,25 @@ from pathlib import Path
 from threading import Event
 from typing import Any, Callable
 
-from .beeline import _bounded_text, build_export_script, build_script, parse_dsv, validate_read_only
+from .beeline import (
+    _bounded_text,
+    build_export_script,
+    build_script,
+    is_row_returning_sql,
+    parse_dsv,
+    rows_as_dicts,
+    unique_columns,
+    validate_read_only,
+)
 from .config import MAX_TIMEOUT_SECONDS, CarbonLensError, ConfigStore
 from .ssh import connect
 
 
 def _bounded_export_sql(sql: str, limit: int) -> str:
     cleaned = sql.strip().rstrip(";").strip()
-    if re.match(r"(?is)^select\b", cleaned):
-        return f"SELECT * FROM ({cleaned}) AS carbon_lens_export LIMIT {limit};"
+    bounded_limit = max(1, int(limit))
+    if is_row_returning_sql(cleaned):
+        return f"SELECT * FROM ({cleaned}) AS carbon_lens_export LIMIT {bounded_limit};"
     return cleaned
 
 
@@ -27,7 +37,11 @@ def _csv_summary(path: Path) -> tuple[list[str], int]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.reader(handle)
         columns = next(reader, [])
-        row_count = sum(1 for _ in reader)
+        row_count = 0
+        for row in reader:
+            if len(row) != len(columns):
+                raise CarbonLensError("CSV export contains a row with a different column count")
+            row_count += 1
     return columns, row_count
 
 
@@ -96,13 +110,22 @@ class CarbonLensService:
             finally:
                 session.remove(remote_sql)
         elapsed_ms = int((time.monotonic() - started) * 1000)
+        result_columns, original_columns, column_name_map = unique_columns(columns)
+        result_rows = rows_as_dicts(columns, rows, result_columns)
         return {
             "connection": connection,
             "transport": "ssh-beeline",
-            "columns": columns,
-            "rows": [dict(zip(columns, row)) for row in rows],
+            "columns": result_columns,
+            "original_columns": original_columns,
+            "column_name_map": column_name_map,
+            "rows": result_rows,
             "row_count": len(rows),
+            "returned_row_count": len(rows),
+            "total_row_count": None,
+            "total_count_known": False,
+            "has_more": truncated,
             "truncated": truncated,
+            "type_info_unavailable": True,
             "elapsed_ms": elapsed_ms,
         }
 
@@ -201,13 +224,27 @@ class CarbonLensService:
             local_part.unlink(missing_ok=True)
             raise
 
+        if row_count > limit:
+            truncation: bool | str = True
+        elif row_count == limit and is_row_returning_sql(sql):
+            # The remote file was intentionally capped.  Reaching the cap is
+            # not evidence that the source contained no additional rows.
+            truncation = "unknown"
+        else:
+            truncation = False
         return {
             "connection": connection,
             "format": "csv",
             "path": str(target),
             "columns": columns,
             "row_count": row_count,
-            "truncated": False,
+            "returned_row_count": row_count,
+            "total_row_count": None,
+            "total_count_known": False,
+            "has_more": truncation,
+            "truncated": truncation,
+            "effective_limit": limit,
+            "type_info_unavailable": True,
             "elapsed_ms": int((time.monotonic() - started) * 1000),
         }
 
@@ -228,7 +265,7 @@ class CarbonLensService:
         result = self.query(connection, sql, limit=limit, timeout_seconds=timeout_seconds)
         config = self.config_store.get(connection)
         config.export_dir.mkdir(parents=True, exist_ok=True)
-        suffix = ".csv" if format == "csv" else ".json"
+        suffix = ".json"
         requested = filename or f"carbon-export-{time.strftime('%Y%m%d-%H%M%S')}{suffix}"
         safe_name = Path(requested).name
         if not safe_name.lower().endswith(suffix):
@@ -236,19 +273,26 @@ class CarbonLensService:
         target = (config.export_dir / safe_name).resolve()
         if config.export_dir not in target.parents:
             raise CarbonLensError("导出文件路径必须位于配置的 export_dir 内")
-        if format == "csv":
-            with target.open("w", encoding="utf-8-sig", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=result["columns"], extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(result["rows"])
-        else:
-            target.write_text(json.dumps(result["rows"], ensure_ascii=False, indent=2), encoding="utf-8")
+        part = target.with_name(f".{target.name}.{uuid.uuid4().hex}.part")
+        try:
+            part.write_text(json.dumps(result["rows"], ensure_ascii=False, indent=2), encoding="utf-8")
+            part.replace(target)
+        except Exception:
+            part.unlink(missing_ok=True)
+            raise
         return {
             "connection": connection,
             "format": format,
             "path": str(target),
             "columns": result["columns"],
+            "original_columns": result.get("original_columns", result["columns"]),
             "row_count": result["row_count"],
+            "returned_row_count": result.get("returned_row_count", result["row_count"]),
+            "total_row_count": result.get("total_row_count"),
+            "total_count_known": result.get("total_count_known", False),
+            "has_more": result.get("has_more", result["truncated"]),
             "truncated": result["truncated"],
+            "effective_limit": max(1, min(int(limit), config.max_rows)),
+            "type_info_unavailable": True,
             "elapsed_ms": result["elapsed_ms"],
         }
