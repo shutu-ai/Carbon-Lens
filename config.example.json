@@ -23,7 +23,12 @@
       "export_dir": "exports",
       "timeout_seconds": 600,
       "max_rows": 1000000,
-      "max_output_bytes": 104857600
+      "max_output_bytes": 104857600,
+      "write_workspace": {
+        "enabled": false,
+        "schema": "carbon_lens_workspace",
+        "table_prefix": "cl_tmp_"
+      }
     }
   }
 }

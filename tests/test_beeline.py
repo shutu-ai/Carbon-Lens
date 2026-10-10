@@ -3,6 +3,7 @@ from carbon_lens.beeline import (
     END_MARKER,
     build_export_script,
     build_export_job_script,
+    build_write_job_script,
     build_script,
     parse_dsv,
     rows_as_dicts,
@@ -80,6 +81,26 @@ def test_build_export_job_script_persists_status_and_supports_cancel():
     assert "-f /tmp/carbon-lens-export-test/cancel" in script
     assert "< /dev/null > /tmp/carbon-lens-export-test/result.csv" in script
     assert not script.startswith("su - root -c")
+
+
+def test_build_write_job_script_is_detached_durable_and_not_a_row_query():
+    script = build_write_job_script(
+        config(),
+        "/tmp/carbon-lens-write-test/statement.sql",
+        "/tmp/carbon-lens-write-test/result.log",
+        "/tmp/carbon-lens-write-test/status",
+        "/tmp/carbon-lens-write-test/pid",
+        "/tmp/carbon-lens-write-test/cancel",
+        remote_dir="/tmp/carbon-lens-write-test",
+        timeout_seconds=600,
+    )
+    assert "RUNNING > /tmp/carbon-lens-write-test/status" in script
+    assert "SUCCEEDED > /tmp/carbon-lens-write-test/status" in script
+    assert "FAILED > /tmp/carbon-lens-write-test/status" in script
+    assert "CANCELLED > /tmp/carbon-lens-write-test/status" in script
+    assert "< /dev/null > /dev/null" in script
+    assert "-f /tmp/carbon-lens-write-test/cancel" in script
+    assert "--outputformat" not in script
 
 
 def test_parse_dsv_is_bounded():

@@ -45,3 +45,25 @@ def test_local_ssh_paths_are_relative_to_config_directory():
     config = store.get("prod")
     assert config.ssh["private_key"] == str(Path("D:/carbon-lens/config/keys/carbon_ed25519").resolve())
     assert config.known_hosts == str(Path("D:/carbon-lens/config/keys/known_hosts").resolve())
+
+
+def test_write_workspace_is_disabled_by_default_and_parsed_explicitly():
+    store = ConfigStore("unused.json")
+    store._payload = {
+        "connections": {
+            "prod": {
+                "ssh_config": {"hostname": "carbon.example", "username": "analyst"},
+            }
+        }
+    }
+    assert store.get("prod").write_workspace_enabled is False
+
+    store._payload["connections"]["prod"]["write_workspace"] = {
+        "enabled": True,
+        "schema": "carbon_lens_workspace",
+        "table_prefix": "cl_tmp_",
+    }
+    config = store.get("prod")
+    assert config.write_workspace_enabled is True
+    assert config.write_workspace_schema == "carbon_lens_workspace"
+    assert config.write_table_prefix == "cl_tmp_"

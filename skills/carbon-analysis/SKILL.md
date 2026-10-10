@@ -195,11 +195,48 @@ For tool errors, use:
 Do not turn an authentication, timeout, validation, or missing-table error
 into a generic empty-result message.
 
+## Managed intermediate-table writes
+
+The analysis/query/export tools remain read-only. Do not route a write through
+`carbon_query`, `carbon_query_start`, `carbon_export`, or arbitrary shell/SFTP
+commands. When the user explicitly requests a managed intermediate table, use
+only these server-side policy-checked tools:
+
+- `carbon_workspace_create_start` or `carbon_workspace_create` for a generated
+  CTAS target from a `SELECT`/`WITH ... SELECT` source.
+- `carbon_execute_start` or `carbon_execute` for the supported
+  `CREATE TABLE <workspace>.<generated> AS SELECT`, `INSERT INTO`,
+  `INSERT OVERWRITE TABLE`, and managed `DROP TABLE` statements.
+- `carbon_execute_status`, `carbon_execute_list`, and `carbon_execute_cancel`
+  for lifecycle observation and cancellation requests.
+- `carbon_workspace_list` to inspect only tables registered by CarbonLens.
+
+The workspace must be explicitly enabled in configuration and must name a
+dedicated schema and table prefix. Original, third-party, unregistered, or
+ambiguous targets are rejected before remote submission. A target is writable
+only after its persisted reservation reaches `active`; a reservation in
+`reserved`, `creating`, `create_unknown`, or any failed state is not writable.
+
+Always provide a stable `idempotency_key` for retriable client requests. A
+repeated key returns the original execution; a conflicting SQL, connection, or
+target is rejected. If SSH startup, remote status, or final identity
+verification is uncertain, the result is `unknown` with
+`reconciliation_required`. Do not resubmit the write or infer success from a
+client timeout. Cancellation is a request, not a database rollback; poll the
+same execution until the remote state is authoritative.
+
+Use virtual schema/table names in examples and never include credentials,
+keytabs, private keys, raw SSH diagnostics, or production table contents. Do
+not claim real-write acceptance unless an explicitly approved dedicated
+CarbonLens workspace was used; otherwise report `BLOCKED_ENV`.
+
 ## Safety
 
-- Only use read-only SQL: `SELECT`, `SHOW`, `DESCRIBE`, `DESC`, `EXPLAIN`, or `USE`.
-- Never attempt `INSERT`, `UPDATE`, `DELETE`, `DROP`, `TRUNCATE`, `ALTER`, or
-  arbitrary shell commands through these tools.
+- For analysis and export, use only read-only SQL: `SELECT`, `SHOW`,
+  `DESCRIBE`, `DESC`, `EXPLAIN`, or `USE`.
+- For writes, use only the managed tools above. Never attempt `UPDATE`,
+  `DELETE`, `ALTER`, `TRUNCATE`, `RENAME`, `CREATE OR REPLACE`, external
+  `LOCATION`, multi-statement SQL, or arbitrary shell commands.
 - Keep queries bounded by time filters, explicit SQL `LIMIT` for `SELECT`, tool
   row limits, and the configured timeout. Never send multiple SQL statements in
   one call, even if the first statement is read-only.

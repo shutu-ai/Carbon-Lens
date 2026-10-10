@@ -455,6 +455,83 @@ def build_export_job_script(
     return script
 
 
+def build_write_job_script(
+    config: ConnectionConfig,
+    remote_sql_path: str,
+    remote_log_path: str,
+    remote_status_path: str,
+    remote_pid_path: str,
+    remote_cancel_path: str,
+    remote_dir: str,
+    ttl_seconds: int = 2 * 24 * 60 * 60,
+    timeout_seconds: int = 7200,
+) -> str:
+    """Build a durable detached DDL/DML job without treating output as rows."""
+    source = shlex.quote(config.env_script)
+    keytab = shlex.quote(config.keytab)
+    principal = shlex.quote(config.principal)
+    beeline = shlex.quote(config.beeline_path)
+    alias = shlex.quote(config.beeline_connection)
+    sql_file = shlex.quote(remote_sql_path)
+    log_file = shlex.quote(remote_log_path)
+    status_file = shlex.quote(remote_status_path)
+    pid_file = shlex.quote(remote_pid_path)
+    cancel_file = shlex.quote(remote_cancel_path)
+    cleanup_dir = shlex.quote(remote_dir)
+    ttl = max(3600, int(ttl_seconds))
+    command = (
+        beeline + " " + alias + " -f " + sql_file
+        + " < /dev/null > /dev/null 2> " + log_file
+    )
+    timeout = max(1, int(timeout_seconds))
+    return "\n".join(
+        [
+            "#!/bin/bash",
+            "export TERM=dumb",
+            "umask 022",
+            "child_pid=''",
+            "watchdog_pid=''",
+            "cancel_monitor_pid=''",
+            "fail() {",
+            "  if [ -n \"${watchdog_pid:-}\" ]; then kill \"$watchdog_pid\" 2>/dev/null || true; fi",
+            "  printf '%s\\n' FAILED > " + status_file,
+            "  printf '%s\\n' \"$2\" >> " + log_file,
+            "  exit \"$1\"",
+            "}",
+            "cancelled() {",
+            "  if [ -n \"${child_pid:-}\" ]; then kill -TERM \"$child_pid\" 2>/dev/null || true; fi",
+            "  if [ -n \"${child_pid:-}\" ]; then sleep 2; kill -KILL \"$child_pid\" 2>/dev/null || true; fi",
+            "  if [ -n \"${watchdog_pid:-}\" ]; then kill \"$watchdog_pid\" 2>/dev/null || true; fi",
+            "  if [ -n \"${cancel_monitor_pid:-}\" ]; then kill \"$cancel_monitor_pid\" 2>/dev/null || true; fi",
+            "  printf '%s\\n' CANCELLED > " + status_file,
+            "  printf '%s\\n' 'remote write cancelled' >> " + log_file,
+            "  exit 143",
+            "}",
+            "trap cancelled TERM INT HUP",
+            "printf '%s\\n' \"$$\" > " + pid_file,
+            "printf '%s\\n' RUNNING > " + status_file,
+            "nohup sh -c " + shlex.quote("sleep " + str(ttl) + "; rm -rf -- " + cleanup_dir) + " >/dev/null 2>&1 < /dev/null &",
+            "source " + source + " >/dev/null 2>&1 || fail 20 'environment script failed'",
+            "kinit -kt " + keytab + " " + principal + " >> " + log_file + " 2>&1 || fail 21 'kinit failed'",
+            "if [ -f " + cancel_file + " ]; then cancelled; fi",
+            command + " &",
+            "child_pid=$!",
+            "( sleep " + str(timeout) + "; if kill -0 \"$child_pid\" 2>/dev/null; then kill -TERM \"$child_pid\" 2>/dev/null || true; sleep 30; if kill -0 \"$child_pid\" 2>/dev/null; then kill -KILL \"$child_pid\" 2>/dev/null || true; fi; printf '%s\\n' 'remote write timeout' >> " + log_file + "; fi ) >/dev/null 2>&1 &",
+            "watchdog_pid=$!",
+            "( while kill -0 \"$child_pid\" 2>/dev/null; do if [ -f " + cancel_file + " ]; then kill -TERM \"$$\" 2>/dev/null || true; break; fi; sleep 1; done ) >/dev/null 2>&1 &",
+            "cancel_monitor_pid=$!",
+            "wait \"$child_pid\"",
+            "status=$?",
+            "child_pid=''",
+            "kill \"$watchdog_pid\" 2>/dev/null || true",
+            "kill \"$cancel_monitor_pid\" 2>/dev/null || true",
+            "if [ \"$status\" -eq 0 ]; then printf '%s\\n' SUCCEEDED > " + status_file + "; else printf '%s\\n' FAILED > " + status_file + "; fi",
+            "chmod 644 " + status_file + " " + log_file + " " + pid_file + " 2>/dev/null || true",
+            "exit \"$status\"",
+        ]
+    )
+
+
 def _bounded_text(
     lines: Iterable[str],
     max_output_bytes: int,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,9 @@ class ConnectionConfig:
     host_key_sha256: str
     auto_save_host_key: bool = True
     export_temp_ttl_seconds: int = 1800
+    write_workspace_enabled: bool = False
+    write_workspace_schema: str = ""
+    write_table_prefix: str = "cl_tmp_"
 
     @classmethod
     def from_mapping(cls, name: str, raw: dict[str, Any], base_dir: Path) -> "ConnectionConfig":
@@ -93,6 +97,17 @@ class ConnectionConfig:
                 value = default
             return max(low, min(value, high))
 
+        write_workspace = raw.get("write_workspace") or {}
+        if not isinstance(write_workspace, dict):
+            raise CarbonLensError("write_workspace must be an object")
+        write_enabled = write_workspace.get("enabled", False)
+        if not isinstance(write_enabled, bool):
+            raise CarbonLensError("write_workspace.enabled must be a boolean")
+        write_schema = str(write_workspace.get("schema") or "").strip()
+        write_prefix = str(write_workspace.get("table_prefix") or "cl_tmp_").strip()
+        if write_prefix and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", write_prefix):
+            raise CarbonLensError("write_workspace.table_prefix must be an identifier prefix")
+
         return cls(
             name=name,
             ssh=ssh,
@@ -122,6 +137,9 @@ class ConnectionConfig:
             host_key_sha256=str(raw.get("host_key_sha256") or ""),
             auto_save_host_key=bool(raw.get("auto_save_host_key", True)),
             export_temp_ttl_seconds=bounded_int("export_temp_ttl_seconds", 1800, 300, 86400),
+            write_workspace_enabled=write_enabled,
+            write_workspace_schema=write_schema,
+            write_table_prefix=write_prefix,
         )
 
 

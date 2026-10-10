@@ -1,10 +1,12 @@
 # CarbonLens
 
-CarbonLens is a Python MCP server for bounded, read-only CarbonData analysis
-and CSV/JSON export through SSH and `fiber-beeline`.
+CarbonLens is a Python MCP server for bounded CarbonData analysis, CSV/JSON
+export, and opt-in managed intermediate-table execution through SSH and
+`fiber-beeline`.
 
-The first version intentionally exposes no arbitrary shell tool and no write
-SQL tool. Credentials stay in the server-side JSON configuration.
+Arbitrary shell access is never exposed. Write operations are disabled by
+default and, when explicitly enabled, are restricted to CarbonLens-registered
+workspace tables. Credentials stay in the server-side JSON configuration.
 
 ## Install
 
@@ -56,7 +58,10 @@ Configure Codex to launch that command as a stdio MCP server. Keep
 `carbon_list_connections`, `carbon_query`, `carbon_query_start`,
 `carbon_query_status`, `carbon_query_list`, `carbon_query_cancel`,
 `carbon_describe`, `carbon_export`, `carbon_export_start`,
-`carbon_export_status`, `carbon_export_list`, and `carbon_export_cancel`.
+`carbon_export_status`, `carbon_export_list`, `carbon_export_cancel`,
+`carbon_execute`, `carbon_execute_start`, `carbon_execute_status`,
+`carbon_execute_list`, `carbon_execute_cancel`, `carbon_workspace_list`,
+`carbon_workspace_create_start`, and `carbon_workspace_create`.
 
 Query and export commands use a 10-minute default timeout. Each call may set
 `timeout_seconds` up to 7200 seconds (2 hours); the configured connection value
@@ -109,6 +114,35 @@ downloads the file through SFTP into the configured `export_dir` and only then
 reports `status = succeeded`. A failed download remains retryable through the
 same status call and does not rerun the SQL. Use `carbon_export_list` to view
 export history and `carbon_export_cancel` to request remote cancellation.
+
+## Managed intermediate tables
+
+Write execution is fail-closed unless a connection contains an explicit
+configuration such as:
+
+```json
+"write_workspace": {
+  "enabled": false,
+  "schema": "carbon_lens_workspace",
+  "table_prefix": "cl_tmp_"
+}
+```
+
+Only one SQL statement from the supported CTAS/INSERT/DROP subset is accepted.
+The service rejects writes to original tables, unknown workspace tables,
+external locations, multi-statement input, and unsupported SQL before opening a
+remote execution session. `carbon_workspace_create_start` generates a fresh
+workspace target for a read-only `SELECT`; `carbon_execute_start` is used for
+approved `INSERT INTO`, `INSERT OVERWRITE TABLE`, and `DROP TABLE` operations.
+
+Each operation returns an `execution_id` and is persisted in the same SQLite
+job database as the existing background tasks. An idempotency key can be
+reused to observe the original execution; reusing it with a different request
+returns `IDEMPOTENCY_CONFLICT`. If remote completion cannot be proven, the
+execution becomes `unknown` / `EXECUTION_UNKNOWN` and CarbonLens never
+resubmits the write automatically. Use `carbon_execute_status` and
+`carbon_workspace_list` to reconcile the original task and managed-table
+registration.
 
 ## Validate locally
 

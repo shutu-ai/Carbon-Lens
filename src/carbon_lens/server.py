@@ -13,6 +13,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised at startup on
 
 from .jobs import QueryJobManager
 from .exports import ExportJobManager
+from .executions import WriteExecutionManager
 from .lifecycle import InstanceAlreadyRunning, InstanceLock, ParentProcessMonitor
 from .service import CarbonLensService
 
@@ -20,6 +21,7 @@ app = FastMCP("carbon-lens")
 _service: CarbonLensService | None = None
 _query_jobs: QueryJobManager | None = None
 _export_jobs: ExportJobManager | None = None
+_write_executions: WriteExecutionManager | None = None
 
 
 def service() -> CarbonLensService:
@@ -41,6 +43,13 @@ def export_jobs() -> ExportJobManager:
     if _export_jobs is None:
         _export_jobs = ExportJobManager(service)
     return _export_jobs
+
+
+def write_executions() -> WriteExecutionManager:
+    global _write_executions
+    if _write_executions is None:
+        _write_executions = WriteExecutionManager(service)
+    return _write_executions
 
 
 @app.tool()
@@ -125,6 +134,82 @@ def carbon_export_list(status: str | None = None, limit: int = 50) -> dict[str, 
 def carbon_export_cancel(export_id: str) -> dict[str, Any]:
     """Cancel a background export job and its remote Carbon process."""
     return export_jobs().cancel(export_id)
+
+
+@app.tool()
+def carbon_execute(
+    connection: str,
+    sql: str,
+    idempotency_key: str | None = None,
+    timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Execute one approved managed-table CTAS/INSERT/DROP operation."""
+    return write_executions().execute(
+        connection, sql, idempotency_key=idempotency_key, timeout_seconds=timeout_seconds
+    )
+
+
+@app.tool()
+def carbon_execute_start(
+    connection: str,
+    sql: str,
+    idempotency_key: str | None = None,
+    timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Start one approved managed-table CTAS/INSERT/DROP operation."""
+    return write_executions().submit(
+        connection, sql, idempotency_key=idempotency_key, timeout_seconds=timeout_seconds
+    )
+
+
+@app.tool()
+def carbon_execute_status(execution_id: str) -> dict[str, Any]:
+    """Observe a managed-table write without resubmitting SQL."""
+    return write_executions().status(execution_id)
+
+
+@app.tool()
+def carbon_execute_list(status: str | None = None, limit: int = 50) -> dict[str, Any]:
+    """List persisted managed-table write executions."""
+    return write_executions().list_jobs(status=status, limit=limit)
+
+
+@app.tool()
+def carbon_execute_cancel(execution_id: str) -> dict[str, Any]:
+    """Request cancellation of a managed-table write."""
+    return write_executions().cancel(execution_id)
+
+
+@app.tool()
+def carbon_workspace_list(connection: str, state: str | None = None, limit: int = 100) -> dict[str, Any]:
+    """List only CarbonLens-registered intermediate tables."""
+    return write_executions().workspace_list(connection, state=state, limit=limit)
+
+
+@app.tool()
+def carbon_workspace_create_start(
+    connection: str,
+    select_sql: str,
+    idempotency_key: str | None = None,
+    timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Generate and start a uniquely named managed CTAS operation."""
+    return write_executions().create_from_select(
+        connection, select_sql, idempotency_key=idempotency_key, timeout_seconds=timeout_seconds
+    )
+
+
+@app.tool()
+def carbon_workspace_create(
+    connection: str,
+    select_sql: str,
+    idempotency_key: str | None = None,
+    timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Generate and synchronously complete a uniquely named managed CTAS operation."""
+    return write_executions().create_from_select(
+        connection, select_sql, idempotency_key=idempotency_key, timeout_seconds=timeout_seconds, wait=True
+    )
 
 
 @app.tool()
