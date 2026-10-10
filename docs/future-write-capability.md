@@ -21,6 +21,22 @@ locations, multi-statement SQL, and arbitrary shell execution remain rejected.
 These capabilities are used only after server-side policy, workspace
 configuration, managed-table ownership, idempotency, and lifecycle checks pass.
 
+## Ownership identity and local atomicity
+
+Every CarbonLens CTAS generates an unpredictable ownership token and injects it
+as the `carbon_lens_ownership_token` Carbon `TBLPROPERTIES` value. The token is
+stored with the table reservation and checked with `DESC FORMATTED` before CTAS
+activation and before later INSERT operations. A missing metadata response,
+missing token, or mismatch returns `OWNERSHIP_UNVERIFIED`; a matching name or
+`cl_tmp_` prefix alone is never sufficient. DROP is accepted only after the
+same pre-drop identity check and a post-drop absence check.
+
+The execution row and CTAS reservation are committed in one SQLite transaction
+before remote submission. A local transaction failure rolls back both records
+and never starts a remote job. If an INSERT becomes uncertain, its managed
+target enters `insert_unknown` and further writes are blocked until manual
+reconciliation; no compensating or automatic retry is issued.
+
 ## Execution contract
 
 `carbon_execute` and `carbon_execute_start` accept one approved write statement

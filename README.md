@@ -134,15 +134,21 @@ external locations, multi-statement input, and unsupported SQL before opening a
 remote execution session. `carbon_workspace_create_start` generates a fresh
 workspace target for a read-only `SELECT`; `carbon_execute_start` is used for
 approved `INSERT INTO`, `INSERT OVERWRITE TABLE`, and `DROP TABLE` operations.
+For CTAS, CarbonLens injects a random ownership token into a Carbon
+`TBLPROPERTIES` value and verifies it through `DESC FORMATTED` before the table
+becomes active. A missing or mismatched token is `OWNERSHIP_UNVERIFIED` and is
+never treated as a successful ownership check.
 
 Each operation returns an `execution_id` and is persisted in the same SQLite
 job database as the existing background tasks. An idempotency key can be
 reused to observe the original execution; reusing it with a different request
-returns `IDEMPOTENCY_CONFLICT`. If remote completion cannot be proven, the
-execution becomes `unknown` / `EXECUTION_UNKNOWN` and CarbonLens never
-resubmits the write automatically. Use `carbon_execute_status` and
-`carbon_workspace_list` to reconcile the original task and managed-table
-registration.
+returns `IDEMPOTENCY_CONFLICT`. CTAS execution metadata and its table
+reservation are committed in one SQLite transaction before remote submission.
+If remote completion cannot be proven, the execution becomes `unknown` /
+`EXECUTION_UNKNOWN`, an affected managed target is quarantined when necessary,
+and CarbonLens never resubmits the write automatically. Use
+`carbon_execute_status` and `carbon_workspace_list` to reconcile the original
+task and managed-table registration.
 
 ## Validate locally
 

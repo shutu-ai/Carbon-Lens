@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 import re
+import sqlite3
 import time
 import uuid
 
@@ -58,12 +59,26 @@ class FakeService:
     def __init__(self, tmp_path: Path, enabled: bool = True):
         self.config_store = FakeStore(tmp_path, enabled)
         self.exists: set[str] = set()
+        self.tokens: dict[str, str] = {}
 
     def describe(self, connection: str, table: str):
         assert connection == "test"
         if table not in self.exists:
             raise CarbonLensError("table does not exist")
         return {"columns": ["col_name"], "rows": []}
+
+    def describe_formatted(self, connection: str, table: str):
+        self.describe(connection, table)
+        return {
+            "columns": ["col_name", "data_type", "comment"],
+            "rows": [
+                {
+                    "col_name": "carbon_lens_ownership_token",
+                    "data_type": self.tokens.get(table, ""),
+                    "comment": "",
+                }
+            ],
+        }
 
 
 class FakeSession:
@@ -89,7 +104,11 @@ class FakeSession:
             self.sql = content
             match = re.search(r"CREATE\s+TABLE\s+([A-Za-z_][\w$]*\.[A-Za-z_][\w$]*)", content, re.I)
             if match:
-                self.service.exists.add(match.group(1))
+                target = match.group(1)
+                self.service.exists.add(target)
+                token = re.search(r"carbon_lens_ownership_token'\s*=\s*'([^']+)'", content, re.I)
+                if token:
+                    self.service.tokens[target] = token.group(1)
         elif remote_path.endswith("/cancel"):
             self.cancel_uploads += 1
 
@@ -148,6 +167,8 @@ def test_ctas_reserves_before_remote_start_and_activates_only_after_identity_che
         queued = manager.submit("test", "CREATE TABLE carbon_lens_workspace.cl_tmp_a1 AS SELECT 1", idempotency_key="create-a1")
 
         assert queued["status"] == "running"
+        assert "STORED AS carbondata" in session.sql
+        assert "carbon_lens_ownership_token" in session.sql
         reserved = manager.workspace_list("test")["tables"]
         assert reserved[0]["state"] == "creating"
         completed = manager.status(queued["execution_id"])
@@ -186,6 +207,7 @@ def test_insert_and_drop_require_active_registration_and_update_state(monkeypatc
         service = FakeService(tmp_path)
         session = FakeSession(service)
         service.exists.add("carbon_lens_workspace.cl_tmp_owned")
+        service.tokens["carbon_lens_workspace.cl_tmp_owned"] = "cl_own_seed"
         monkeypatch.setenv("CARBON_LENS_JOB_DB", str(tmp_path / "jobs.sqlite3"))
         monkeypatch.setattr("carbon_lens.executions.connect", lambda config: session)
         manager = WriteExecutionManager(lambda: service)
@@ -197,6 +219,7 @@ def test_insert_and_drop_require_active_registration_and_update_state(monkeypatc
                 "qualified_name": "carbon_lens_workspace.cl_tmp_owned",
                 "create_execution_id": "cx_seed",
                 "create_sql_fingerprint": "seed",
+                "ownership_token": "cl_own_seed",
                 "state": "active",
                 "created_at": "now",
                 "activated_at": "now",
@@ -214,6 +237,122 @@ def test_insert_and_drop_require_active_registration_and_update_state(monkeypatc
         assert manager.workspace_list("test")["tables"][0]["state"] == "dropped"
         with pytest.raises(WritePolicyError, match="UNOWNED_TABLE"):
             manager.submit("test", "INSERT INTO carbon_lens_workspace.cl_tmp_owned SELECT 1")
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_registered_name_with_replaced_remote_identity_is_rejected_before_write(monkeypatch):
+    tmp_path = runtime_dir()
+    try:
+        service = FakeService(tmp_path)
+        session = FakeSession(service)
+        target = "carbon_lens_workspace.cl_tmp_identity"
+        service.exists.add(target)
+        service.tokens[target] = "cl_own_external"
+        monkeypatch.setenv("CARBON_LENS_JOB_DB", str(tmp_path / "jobs.sqlite3"))
+        monkeypatch.setattr("carbon_lens.executions.connect", lambda config: session)
+        manager = WriteExecutionManager(lambda: service)
+        manager._insert_table(
+            {
+                "table_id": "mt_identity",
+                "connection": "test",
+                "workspace_schema": "carbon_lens_workspace",
+                "qualified_name": target,
+                "create_execution_id": "cx_identity",
+                "create_sql_fingerprint": "seed",
+                "ownership_token": "cl_own_registered",
+                "state": "active",
+                "created_at": "now",
+                "activated_at": "now",
+                "dropped_at": None,
+                "last_verified_at": "now",
+                "error": None,
+            }
+        )
+
+        with pytest.raises(WritePolicyError, match="OWNERSHIP_UNVERIFIED"):
+            manager.submit("test", f"INSERT INTO {target} SELECT 1", idempotency_key="identity-mismatch")
+        assert session.start_count == 0
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+@pytest.mark.parametrize("failing_table", ["executions", "managed_tables"])
+def test_ctas_local_reservation_transaction_rolls_back_before_remote_start(monkeypatch, failing_table):
+    tmp_path = runtime_dir()
+    try:
+        service = FakeService(tmp_path)
+        session = FakeSession(service)
+        monkeypatch.setenv("CARBON_LENS_JOB_DB", str(tmp_path / "jobs.sqlite3"))
+        monkeypatch.setattr("carbon_lens.executions.connect", lambda config: session)
+        manager = WriteExecutionManager(lambda: service)
+        conn = manager._connect_db()
+        conn.execute(
+            f"CREATE TRIGGER injected_failure BEFORE INSERT ON {failing_table} "
+            "BEGIN SELECT RAISE(ABORT, 'injected local failure'); END"
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(WritePolicyError, match="RESERVATION_CONFLICT"):
+            manager.submit(
+                "test",
+                "CREATE TABLE carbon_lens_workspace.cl_tmp_atomic AS SELECT 1",
+                idempotency_key="atomic-failure",
+            )
+
+        conn = manager._connect_db()
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM managed_tables").fetchone()[0] == 0
+        finally:
+            conn.close()
+        assert session.start_count == 0
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_existing_managed_table_schema_migrates_without_claiming_identity(monkeypatch):
+    tmp_path = runtime_dir()
+    try:
+        database = tmp_path / "jobs.sqlite3"
+        conn = sqlite3.connect(database)
+        conn.executescript(
+            """
+            CREATE TABLE managed_tables (
+                table_id TEXT PRIMARY KEY,
+                connection TEXT NOT NULL,
+                workspace_schema TEXT NOT NULL,
+                qualified_name TEXT NOT NULL,
+                create_execution_id TEXT NOT NULL UNIQUE,
+                create_sql_fingerprint TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                activated_at TEXT,
+                dropped_at TEXT,
+                last_verified_at TEXT,
+                error TEXT
+            );
+            INSERT INTO managed_tables VALUES
+            ('mt_old', 'test', 'carbon_lens_workspace', 'carbon_lens_workspace.cl_tmp_old',
+             'cx_old', 'seed', 'active', 'now', 'now', NULL, 'now', NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+        service = FakeService(tmp_path)
+        monkeypatch.setenv("CARBON_LENS_JOB_DB", str(database))
+        manager = WriteExecutionManager(lambda: service)
+
+        conn = manager._connect_db()
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(managed_tables)").fetchall()}
+            old_row = conn.execute("SELECT table_id, state, ownership_token FROM managed_tables").fetchone()
+        finally:
+            conn.close()
+
+        assert "ownership_token" in columns
+        assert tuple(old_row) == ("mt_old", "active", None)
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -342,6 +481,45 @@ def test_missing_remote_status_times_out_to_unknown_without_resubmission(monkeyp
         assert again["execution_id"] == submitted["execution_id"]
         assert again["status"] == "unknown"
         assert session.start_count == 1
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_unknown_insert_quarantines_managed_target_until_reconciliation(monkeypatch):
+    tmp_path = runtime_dir()
+    try:
+        service = FakeService(tmp_path)
+        session = FakeSession(service, state="")
+        target = "carbon_lens_workspace.cl_tmp_quarantine"
+        service.exists.add(target)
+        service.tokens[target] = "cl_own_quarantine"
+        monkeypatch.setenv("CARBON_LENS_JOB_DB", str(tmp_path / "jobs.sqlite3"))
+        monkeypatch.setattr("carbon_lens.executions.connect", lambda config: session)
+        manager = WriteExecutionManager(lambda: service)
+        manager._insert_table(
+            {
+                "table_id": "mt_quarantine",
+                "connection": "test",
+                "workspace_schema": "carbon_lens_workspace",
+                "qualified_name": target,
+                "create_execution_id": "cx_quarantine",
+                "create_sql_fingerprint": "seed",
+                "ownership_token": "cl_own_quarantine",
+                "state": "active",
+                "created_at": "now",
+                "activated_at": "now",
+                "dropped_at": None,
+                "last_verified_at": "now",
+                "error": None,
+            }
+        )
+
+        submitted = manager.submit("test", f"INSERT INTO {target} SELECT 1", idempotency_key="insert-unknown")
+        manager._update_execution(submitted["execution_id"], started_epoch=time.time() - 10000, started_at="old")
+        assert manager.status(submitted["execution_id"])["status"] == "unknown"
+        assert manager.workspace_list("test")["tables"][0]["state"] == "insert_unknown"
+        with pytest.raises(WritePolicyError, match="UNOWNED_TABLE"):
+            manager.submit("test", f"INSERT INTO {target} SELECT 1", idempotency_key="insert-after-unknown")
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 

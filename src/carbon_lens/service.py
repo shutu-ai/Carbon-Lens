@@ -134,6 +134,12 @@ class CarbonLensService:
             raise CarbonLensError("表名只能包含字母、数字、下划线和一个点")
         return self.query(connection, f"DESCRIBE {table}", limit=500, timeout_seconds=timeout_seconds)
 
+    def describe_formatted(self, connection: str, table: str, timeout_seconds: int | None = None) -> dict[str, Any]:
+        """Read Carbon table metadata, including TBLPROPERTIES, without rows."""
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?", table or ""):
+            raise CarbonLensError("表名只能包含字母、数字、下划线和一个点")
+        return self.query(connection, f"DESC FORMATTED {table}", limit=500, timeout_seconds=timeout_seconds)
+
     def _export_csv(
         self,
         connection: str,

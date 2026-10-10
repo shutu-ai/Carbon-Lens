@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 from threading import RLock
 import time
@@ -46,7 +47,7 @@ REMOTE_STATES = {
 }
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 OBSERVATION_STATUSES = {"queued", "starting", "running", "cancel_requested", "unknown"}
-TABLE_STATES = {"reserved", "creating", "active", "dropping", "dropped", "create_unknown", "create_failed", "drop_unknown", "drop_failed"}
+TABLE_STATES = {"reserved", "creating", "active", "dropping", "dropped", "create_unknown", "create_failed", "drop_unknown", "drop_failed", "insert_unknown"}
 
 
 def _timestamp() -> str:
@@ -119,10 +120,13 @@ class WriteExecutionManager:
                 return self._snapshot(existing)
 
             table = None
+            table_values: dict[str, Any] | None = None
+            ownership_token: str | None = None
             if plan.kind == "create_table_as_select":
                 if self._get_table(connection, plan.target, include_dropped=False) is not None:
                     raise WritePolicyError("UNOWNED_TABLE", "CTAS target is already registered")
                 self._assert_remote_absent(config, plan.target)
+                ownership_token = "cl_own_" + uuid.uuid4().hex
             else:
                 table = self._require_active_table(connection, plan.target, config.write_workspace_schema)
                 self._assert_remote_present(config, plan.target)
@@ -130,53 +134,74 @@ class WriteExecutionManager:
             execution_id = "cx_" + uuid.uuid4().hex
             remote_dir = f"{config.remote_tmp_dir.rstrip('/')}/carbon-lens-write-{uuid.uuid4().hex}"
             now = time.time()
-            self._insert_execution(
-                {
-                    "execution_id": execution_id,
-                    "connection": connection,
-                    "sql": sql,
-                    "sql_fingerprint": fingerprint,
-                    "idempotency_key": idempotency_key,
-                    "operation": plan.kind,
-                    "target_table": plan.target,
-                    "table_id": table["table_id"] if table is not None else None,
-                    "requested_timeout_seconds": requested_timeout,
-                    "effective_timeout_seconds": effective_timeout,
-                    "status": "queued",
-                    "created_at": _timestamp(),
-                    "created_epoch": now,
-                    "started_at": None,
-                    "started_epoch": None,
-                    "finished_at": None,
-                    "finished_epoch": None,
-                    "remote_dir": remote_dir,
-                    "remote_pid": None,
-                    "error": None,
-                    "error_kind": None,
-                }
-            )
+            execution_values = {
+                "execution_id": execution_id,
+                "connection": connection,
+                "sql": sql,
+                "sql_fingerprint": fingerprint,
+                "idempotency_key": idempotency_key,
+                "operation": plan.kind,
+                "target_table": plan.target,
+                "table_id": table["table_id"] if table is not None else None,
+                "requested_timeout_seconds": requested_timeout,
+                "effective_timeout_seconds": effective_timeout,
+                "status": "queued",
+                "created_at": _timestamp(),
+                "created_epoch": now,
+                "started_at": None,
+                "started_epoch": None,
+                "finished_at": None,
+                "finished_epoch": None,
+                "remote_dir": remote_dir,
+                "remote_pid": None,
+                "error": None,
+                "error_kind": None,
+            }
             if plan.kind == "create_table_as_select":
-                self._insert_table(
-                    {
-                        "table_id": "mt_" + uuid.uuid4().hex,
-                        "connection": connection,
-                        "workspace_schema": config.write_workspace_schema,
-                        "qualified_name": plan.target,
-                        "create_execution_id": execution_id,
-                        "create_sql_fingerprint": fingerprint,
-                        "state": "reserved",
-                        "created_at": _timestamp(),
-                        "activated_at": None,
-                        "dropped_at": None,
-                        "last_verified_at": None,
-                        "error": None,
-                    }
-                )
+                table_values = {
+                    "table_id": "mt_" + uuid.uuid4().hex,
+                    "connection": connection,
+                    "workspace_schema": config.write_workspace_schema,
+                    "qualified_name": plan.target,
+                    "create_execution_id": execution_id,
+                    "create_sql_fingerprint": fingerprint,
+                    "ownership_token": ownership_token,
+                    "state": "reserved",
+                    "created_at": _timestamp(),
+                    "activated_at": None,
+                    "dropped_at": None,
+                    "last_verified_at": None,
+                    "error": None,
+                }
+                execution_values["table_id"] = table_values["table_id"]
+                try:
+                    self._insert_execution_and_table(execution_values, table_values)
+                except sqlite3.IntegrityError as exc:
+                    existing = self._find_idempotency(connection, idempotency_key) if idempotency_key else None
+                    if existing is not None:
+                        if existing["sql_fingerprint"] != fingerprint or existing["target_table"] != plan.target or existing["operation"] != plan.kind:
+                            raise WritePolicyError("IDEMPOTENCY_CONFLICT", "idempotency_key is already bound to a different write request") from exc
+                        return self._snapshot(existing)
+                    raise WritePolicyError("RESERVATION_CONFLICT", "local execution and table reservation could not be committed") from exc
                 table = self._get_table_by_execution(execution_id)
-                self._update_execution(execution_id, table_id=table["table_id"])
+            else:
+                try:
+                    self._insert_execution(execution_values)
+                except sqlite3.IntegrityError as exc:
+                    existing = self._find_idempotency(connection, idempotency_key) if idempotency_key else None
+                    if existing is not None:
+                        if existing["sql_fingerprint"] != fingerprint or existing["target_table"] != plan.target or existing["operation"] != plan.kind:
+                            raise WritePolicyError("IDEMPOTENCY_CONFLICT", "idempotency_key is already bound to a different write request") from exc
+                        return self._snapshot(existing)
+                    raise WritePolicyError("EXECUTION_CONFLICT", "local execution could not be committed") from exc
             self._update_execution(execution_id, status="starting")
             try:
-                remote_pid = self._start_remote_job(config, remote_dir, sql, effective_timeout)
+                remote_sql = (
+                    self._managed_create_sql(plan, ownership_token)
+                    if plan.kind == "create_table_as_select"
+                    else sql
+                )
+                remote_pid = self._start_remote_job(config, remote_dir, remote_sql, effective_timeout)
             except Exception as exc:
                 # A failed SSH/start response does not prove that the remote
                 # command was not submitted. Preserve the ID and require
@@ -343,15 +368,16 @@ class WriteExecutionManager:
         operation = self._operation(row)
         try:
             if operation == "create_table_as_select":
-                if not self._table_exists(config, row["target_table"]):
-                    raise WritePolicyError("EXECUTION_UNKNOWN", "remote CREATE succeeded but target identity could not be verified")
+                table = self._get_table_by_execution(row["execution_id"])
+                self._assert_remote_identity(config, row["target_table"], table["ownership_token"])
                 self._update_table_by_execution(row["execution_id"], state="active", activated_at=_timestamp(), last_verified_at=_timestamp(), error=None)
             elif operation == "drop_table":
                 if self._table_exists(config, row["target_table"]):
                     raise WritePolicyError("EXECUTION_UNKNOWN", "remote DROP succeeded but target still exists")
                 self._update_table_by_id(row["table_id"], state="dropped", dropped_at=_timestamp(), last_verified_at=_timestamp(), error=None)
             else:
-                self._assert_remote_present(config, row["target_table"])
+                table = self._get_table_by_id(row["table_id"])
+                self._assert_remote_identity(config, row["target_table"], table["ownership_token"])
         except WritePolicyError as exc:
             self._mark_unknown(row["execution_id"], str(exc), operation)
             return self._snapshot(self._get_execution(row["execution_id"]))
@@ -377,12 +403,64 @@ class WriteExecutionManager:
 
     def _assert_remote_present(self, config: Any, target: str) -> None:
         try:
-            if not self._table_exists(config, target):
-                raise WritePolicyError("UNOWNED_TABLE", "managed target does not exist remotely")
+            table = self._get_table(config.name, target, include_dropped=False)
+            if table is None:
+                raise WritePolicyError("UNOWNED_TABLE", "target is not registered")
+            self._assert_remote_identity(config, target, table["ownership_token"])
         except WritePolicyError:
             raise
         except Exception as exc:
             raise WritePolicyError("WORKSPACE_NOT_READY", f"cannot verify target identity: {exc}") from exc
+
+    def _assert_remote_identity(self, config: Any, target: str, expected_token: str | None) -> None:
+        if not expected_token:
+            raise WritePolicyError("OWNERSHIP_UNVERIFIED", "managed table has no persisted ownership token")
+        if not self._table_exists(config, target):
+            raise WritePolicyError("UNOWNED_TABLE", "managed target does not exist remotely")
+        actual_token = self._remote_ownership_token(config, target)
+        if actual_token != expected_token:
+            raise WritePolicyError("OWNERSHIP_UNVERIFIED", "remote table ownership token is missing or does not match")
+
+    def _remote_ownership_token(self, config: Any, target: str) -> str | None:
+        service = self._service_factory()
+        describe_formatted = getattr(service, "describe_formatted", None)
+        if not callable(describe_formatted):
+            raise WritePolicyError("OWNERSHIP_UNVERIFIED", "Carbon metadata inspection is unavailable")
+        result = describe_formatted(config.name, target)
+        rows = result.get("rows") if isinstance(result, dict) else None
+        if not isinstance(rows, list):
+            raise WritePolicyError("OWNERSHIP_UNVERIFIED", "Carbon metadata response has no rows")
+        property_name = "carbon_lens_ownership_token"
+        embedded = re.compile(r"carbon_lens_ownership_token\s*[:=]\s*[`'\"]?([A-Za-z0-9_]+)", re.IGNORECASE)
+        for row in rows:
+            if isinstance(row, dict):
+                normalized = {str(key).lower(): value for key, value in row.items()}
+                for value in normalized.values():
+                    match = embedded.search(str(value))
+                    if match:
+                        return match.group(1)
+                for name_key in ("col_name", "property_name", "property", "key", "name"):
+                    if str(normalized.get(name_key, "")).strip().strip("`'\"").lower() == property_name:
+                        for value_key in ("property_value", "value", "data_type", "comment"):
+                            value = normalized.get(value_key)
+                            if value is not None and str(value).strip():
+                                return str(value).strip().strip("`'\"")
+            elif isinstance(row, (list, tuple)):
+                values = ["" if value is None else str(value).strip() for value in row]
+                for index, value in enumerate(values):
+                    if value.strip("`'\"").lower() == property_name and index + 1 < len(values):
+                        candidate = values[index + 1].strip().strip("`'\"")
+                        return candidate or None
+        raise WritePolicyError("OWNERSHIP_UNVERIFIED", "Carbon metadata does not contain the ownership token")
+
+    @staticmethod
+    def _managed_create_sql(plan: SqlPlan, ownership_token: str | None) -> str:
+        if not ownership_token or not plan.source_sql:
+            raise WritePolicyError("OWNERSHIP_UNVERIFIED", "CTAS ownership token could not be generated")
+        return (
+            f"CREATE TABLE {plan.target} STORED AS carbondata "
+            f"TBLPROPERTIES ('carbon_lens_ownership_token'='{ownership_token}') AS {plan.source_sql}"
+        )
 
     def _table_exists(self, config: Any, target: str) -> bool:
         service = self._service_factory()
@@ -454,6 +532,18 @@ class WriteExecutionManager:
             raise CarbonLensError(f"Managed table reservation missing for execution: {execution_id}")
         return row
 
+    def _get_table_by_id(self, table_id: str | None) -> sqlite3.Row:
+        if not table_id:
+            raise WritePolicyError("OWNERSHIP_UNVERIFIED", "execution has no managed table identity")
+        conn = self._connect_db()
+        try:
+            row = conn.execute("SELECT * FROM managed_tables WHERE table_id = ?", (table_id,)).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            raise WritePolicyError("OWNERSHIP_UNVERIFIED", "managed table registration is missing")
+        return row
+
     def _insert_execution(self, values: dict[str, Any]) -> None:
         fields = [
             "execution_id", "connection", "sql", "sql_fingerprint", "idempotency_key", "operation", "target_table", "table_id",
@@ -467,11 +557,39 @@ class WriteExecutionManager:
         finally:
             conn.close()
 
-    def _insert_table(self, values: dict[str, Any]) -> None:
-        fields = ["table_id", "connection", "workspace_schema", "qualified_name", "create_execution_id", "create_sql_fingerprint", "state", "created_at", "activated_at", "dropped_at", "last_verified_at", "error"]
+    def _insert_execution_and_table(self, execution: dict[str, Any], table: dict[str, Any]) -> None:
+        execution_fields = [
+            "execution_id", "connection", "sql", "sql_fingerprint", "idempotency_key", "operation", "target_table", "table_id",
+            "requested_timeout_seconds", "effective_timeout_seconds", "status", "created_at", "created_epoch", "started_at", "started_epoch",
+            "finished_at", "finished_epoch", "remote_dir", "remote_pid", "error", "error_kind",
+        ]
+        table_fields = [
+            "table_id", "connection", "workspace_schema", "qualified_name", "create_execution_id", "create_sql_fingerprint",
+            "ownership_token", "state", "created_at", "activated_at", "dropped_at", "last_verified_at", "error",
+        ]
         conn = self._connect_db()
         try:
-            conn.execute(f"INSERT INTO managed_tables ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})", tuple(values[field] for field in fields))
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                f"INSERT INTO executions ({', '.join(execution_fields)}) VALUES ({', '.join('?' for _ in execution_fields)})",
+                tuple(execution[field] for field in execution_fields),
+            )
+            conn.execute(
+                f"INSERT INTO managed_tables ({', '.join(table_fields)}) VALUES ({', '.join('?' for _ in table_fields)})",
+                tuple(table[field] for field in table_fields),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _insert_table(self, values: dict[str, Any]) -> None:
+        fields = ["table_id", "connection", "workspace_schema", "qualified_name", "create_execution_id", "create_sql_fingerprint", "ownership_token", "state", "created_at", "activated_at", "dropped_at", "last_verified_at", "error"]
+        conn = self._connect_db()
+        try:
+            conn.execute(f"INSERT INTO managed_tables ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})", tuple(values.get(field) for field in fields))
             conn.commit()
         finally:
             conn.close()
@@ -536,6 +654,9 @@ class WriteExecutionManager:
         elif operation == "drop_table":
             row = self._get_execution(execution_id)
             self._update_table_by_id(row["table_id"], state="drop_unknown", error=error)
+        elif operation in {"insert_into", "insert_overwrite"}:
+            row = self._get_execution(execution_id)
+            self._update_table_by_id(row["table_id"], state="insert_unknown", error=error)
 
     def _mark_cancelled(self, execution_id: str, operation: str) -> None:
         self._update_execution(execution_id, status="cancelled", finished_at=_timestamp(), finished_epoch=time.time(), error=None, error_kind=None)
@@ -544,6 +665,9 @@ class WriteExecutionManager:
         elif operation == "drop_table":
             row = self._get_execution(execution_id)
             self._update_table_by_id(row["table_id"], state="drop_failed", error="remote drop cancelled")
+        elif operation in {"insert_into", "insert_overwrite"}:
+            row = self._get_execution(execution_id)
+            self._update_table_by_id(row["table_id"], state="insert_unknown", error="remote insert cancelled")
 
     def _has_timed_out(self, row: sqlite3.Row) -> bool:
         started = row["started_epoch"] or row["created_epoch"]
@@ -587,6 +711,7 @@ class WriteExecutionManager:
                     qualified_name TEXT NOT NULL,
                     create_execution_id TEXT NOT NULL UNIQUE,
                     create_sql_fingerprint TEXT NOT NULL,
+                    ownership_token TEXT,
                     state TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     activated_at TEXT,
@@ -598,6 +723,9 @@ class WriteExecutionManager:
                 CREATE INDEX IF NOT EXISTS idx_managed_tables_state ON managed_tables(connection, state);
                 """
             )
+            managed_columns = {row[1] for row in conn.execute("PRAGMA table_info(managed_tables)").fetchall()}
+            if "ownership_token" not in managed_columns:
+                conn.execute("ALTER TABLE managed_tables ADD COLUMN ownership_token TEXT")
             conn.commit()
         finally:
             conn.close()

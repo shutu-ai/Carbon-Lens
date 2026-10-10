@@ -213,17 +213,23 @@ only these server-side policy-checked tools:
 
 The workspace must be explicitly enabled in configuration and must name a
 dedicated schema and table prefix. Original, third-party, unregistered, or
-ambiguous targets are rejected before remote submission. A target is writable
-only after its persisted reservation reaches `active`; a reservation in
-`reserved`, `creating`, `create_unknown`, or any failed state is not writable.
+ambiguous targets are rejected before remote submission. CTAS receives a random
+`carbon_lens_ownership_token` in Carbon `TBLPROPERTIES`; CarbonLens reads it
+back with `DESC FORMATTED` before activation and before later writes. A matching
+name or prefix without a matching token is not ownership proof. A target is
+writable only after its persisted reservation reaches `active`; a reservation
+in `reserved`, `creating`, `create_unknown`, `insert_unknown`, or any failed
+state is not writable.
 
 Always provide a stable `idempotency_key` for retriable client requests. A
 repeated key returns the original execution; a conflicting SQL, connection, or
 target is rejected. If SSH startup, remote status, or final identity
 verification is uncertain, the result is `unknown` with
-`reconciliation_required`. Do not resubmit the write or infer success from a
-client timeout. Cancellation is a request, not a database rollback; poll the
-same execution until the remote state is authoritative.
+`reconciliation_required`. An uncertain INSERT quarantines its managed target
+as `insert_unknown`; do not write to it until reconciliation. Do not resubmit
+the write or infer success from a client timeout. Cancellation is a request,
+not a database rollback; poll the same execution until the remote state is
+authoritative.
 
 Use virtual schema/table names in examples and never include credentials,
 keytabs, private keys, raw SSH diagnostics, or production table contents. Do
