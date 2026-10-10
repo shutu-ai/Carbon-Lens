@@ -9,13 +9,11 @@ Connection: `carbon-prod` (SSH + Beeline)
 Overall status: **PARTIAL**.
 
 The live connection, bounded synchronous query, asynchronous query persistence,
-cross-process query recovery, and detached CSV/JSON exports pass. The export
-fix keeps Beeline in the detached wrapper's foreground and validates the local
-SFTP result atomically. Deterministic lifecycle fault coverage now passes;
-export recovery after a fresh MCP process restart is implemented, but the two
-latest external retries reached process B and then failed on SSH timeout to the
-Carbon endpoint. Business reconciliation and representative performance remain
-separate `UNVERIFIED` gates.
+cross-process query/export recovery, and detached CSV/JSON exports pass. The
+export fix keeps Beeline in the detached wrapper's foreground and validates the
+local SFTP result atomically. Deterministic lifecycle fault coverage now passes;
+business reconciliation and representative performance remain separate
+`UNVERIFIED` gates.
 
 ## Evidence matrix
 
@@ -25,7 +23,7 @@ separate `UNVERIFIED` gates.
 | MCP/SSH/Beeline smoke | PASS | `SELECT 1 AS acceptance_value`, 1 row, `truncated=false`, about 10.3 s. |
 | Async query | PASS | `.acceptance-data/live-20261010-193443-f3704705/results.json`, exit code 0. |
 | Cross-process query restart | PASS | `.acceptance-data/live-20261010-193523-f3ba93b0/results.json`, exit code 0. |
-| Cross-process export restart | UNVERIFIED | Expanded runner is implemented; two external retries preserved/listed the export ID but B-side polling hit an SSH timeout to the configured Carbon endpoint. |
+| Cross-process export restart | PASS | `.acceptance-data/live-20261010-201624-d3e9386d/results.json`; process B recovered the export ID, terminal state, list entry, and validated CSV file. |
 | Detached CSV/JSON export | PASS | `.acceptance-data/live-20261010-195940-ec756bff/results.json`; both formats succeeded and passed local file validation. |
 | Synchronous CSV export control | PASS | `carbon_export`, one bounded row, readable CSV metadata returned. |
 | Authorized table sample | UNVERIFIED | `sdr_nethouse.cloudphone_sales_users_all`, explicit `LIMIT 100`; no native expected output or full-count proof. |
@@ -65,7 +63,7 @@ Evidence is written under `.acceptance-data/`, which is ignored by Git.
 ## Remaining non-blocking gates
 
 No async export blocker remains for the bounded live gate. Export restart
-verification is pending a reachable Carbon endpoint.
+verification also passes after CarbonData VPN recovery.
 Business-data
 correctness still needs an approved native expected-output file, and performance
 still needs an approved baseline/SLA and representative workload.
