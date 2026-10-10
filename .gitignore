@@ -14,6 +14,8 @@ packages/
 # Generated indexes, build metadata, and test artifacts.
 .codegraph/
 .codex/
+.acceptance-data/
+.carbon-lens-query-results/
 *.egg-info/
 .lifecycle-test-*/
 .pytest-*/

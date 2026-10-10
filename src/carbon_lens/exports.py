@@ -237,6 +237,15 @@ class ExportJobManager:
                 self._update_job(row["export_id"], remote_pid=remote_pid.strip())
                 row = self._get_job(row["export_id"])
 
+            # A remote process can remain in RUNNING or CANCEL_REQUESTED
+            # forever if the scheduler, Beeline, or the SSH-launched wrapper
+            # stops making progress.  Check the deadline before either fast
+            # path so such jobs do not become immortal local records.
+            if self._has_timed_out(row):
+                self._mark_failed(row["export_id"], "Remote export did not complete before timeout_seconds")
+                self._cleanup_remote(session, config, row["remote_dir"])
+                return self._snapshot(self._get_job(row["export_id"]))
+
             if row["status"] == "cancel_requested":
                 if state == EXPORT_SUCCEEDED:
                     return self._complete_success(session, config, row)
@@ -273,11 +282,6 @@ class ExportJobManager:
 
             if state == EXPORT_CANCELLED:
                 self._mark_cancelled(row["export_id"])
-                self._cleanup_remote(session, config, row["remote_dir"])
-                return self._snapshot(self._get_job(row["export_id"]))
-
-            if self._has_timed_out(row):
-                self._mark_failed(row["export_id"], "Remote export did not complete before timeout_seconds")
                 self._cleanup_remote(session, config, row["remote_dir"])
                 return self._snapshot(self._get_job(row["export_id"]))
 

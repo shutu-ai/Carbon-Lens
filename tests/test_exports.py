@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+import time
 import uuid
 
 from carbon_lens.config import ConnectionConfig
@@ -97,6 +98,15 @@ class FlakyDownloadSession(FakeSession):
         super().download_file(remote_path, local_path)
 
 
+class RunningSession(FakeSession):
+    def read_text(self, path: str, max_bytes: int | None = None):
+        if path.endswith("/status"):
+            return "RUNNING\n"
+        if path.endswith("/pid"):
+            return "12345\n"
+        return None
+
+
 def test_background_export_downloads_after_remote_success(monkeypatch):
     tmp_path = runtime_dir()
     try:
@@ -158,6 +168,26 @@ def test_interrupted_download_is_retryable_without_resubmitting_sql(monkeypatch)
         completed = manager.status(queued["export_id"])
         assert completed["status"] == "succeeded"
         assert session.download_attempts == 2
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_running_export_is_failed_after_timeout(monkeypatch):
+    tmp_path = runtime_dir()
+    try:
+        service = FakeService(tmp_path)
+        session = RunningSession()
+        monkeypatch.setenv("CARBON_LENS_JOB_DB", str(tmp_path / "jobs.sqlite3"))
+        monkeypatch.setattr("carbon_lens.exports.connect", lambda config: session)
+
+        manager = ExportJobManager(lambda: service)
+        queued = manager.submit("test", "SELECT * FROM demo", limit=5, timeout_seconds=1)
+        manager._update_job(queued["export_id"], started_epoch=time.time() - 1000)
+
+        failed = manager.status(queued["export_id"])
+
+        assert failed["status"] == "failed"
+        assert "did not complete" in failed["error"]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
