@@ -61,7 +61,8 @@ Configure Codex to launch that command as a stdio MCP server. Keep
 `carbon_export_status`, `carbon_export_list`, `carbon_export_cancel`,
 `carbon_execute`, `carbon_execute_start`, `carbon_execute_status`,
 `carbon_execute_list`, `carbon_execute_cancel`, `carbon_workspace_list`,
-`carbon_workspace_create_start`, and `carbon_workspace_create`.
+`carbon_workspace_create_start`, `carbon_workspace_create`,
+`carbon_workspace_schema_status`, and `carbon_workspace_schema_create`.
 
 Query and export commands use a 10-minute default timeout. Each call may set
 `timeout_seconds` up to 7200 seconds (2 hours); the configured connection value
@@ -123,7 +124,7 @@ configuration such as:
 ```json
 "write_workspace": {
   "enabled": false,
-  "schema": "carbon_lens_workspace",
+  "schema": "carbon_lens",
   "table_prefix": "cl_tmp_"
 }
 ```
@@ -149,6 +150,13 @@ If remote completion cannot be proven, the execution becomes `unknown` /
 and CarbonLens never resubmits the write automatically. Use
 `carbon_execute_status` and `carbon_workspace_list` to reconcile the original
 task and managed-table registration.
+
+Schema preparation is also MCP-only. `carbon_workspace_schema_status` checks
+the configured schema with a read-only `SHOW DATABASES`; it never accepts an
+arbitrary schema name. `carbon_workspace_schema_create` is plan-only by
+default and accepts no SQL; only `confirm=true` can execute the generated
+`CREATE DATABASE IF NOT EXISTS <configured_schema>`. It does not create tables
+or modify any other schema; the table-write switch remains independent.
 
 ## Validate locally
 

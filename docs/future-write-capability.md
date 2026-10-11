@@ -1,13 +1,21 @@
 # Managed write capability boundary
 
-The twelve existing query/describe/export MCP tools, their names, configuration
+The existing query/describe/export MCP tools, their names, configuration
 variables, and behavior remain compatible. This release additionally exposes
-managed write tools, but the write workspace is disabled by default.
+managed write tools and MCP-only workspace schema preparation, but the write
+workspace is disabled by default.
 
 The supported write subset is `CREATE TABLE <workspace>.<new_table> AS SELECT`,
 `INSERT INTO`, `INSERT OVERWRITE TABLE`, and `DROP TABLE` for tables registered
 by CarbonLens. `UPDATE`, `DELETE`, `MERGE`, `ALTER`, `TRUNCATE`, external
 locations, multi-statement SQL, and arbitrary shell execution remain rejected.
+
+Workspace schema creation is a separate, tightly scoped MCP operation. The
+status tool checks only the configured schema. The create tool accepts no raw
+SQL or schema argument, is plan-only unless `confirm=true`, and generates only
+`CREATE DATABASE IF NOT EXISTS <configured_schema>`. Table-write enablement is
+independent; CTAS/INSERT/DROP remain blocked until `write_workspace.enabled`
+is true.
 
 ## Reused transport and lifecycle
 

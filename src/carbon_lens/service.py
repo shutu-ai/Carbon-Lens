@@ -52,6 +52,106 @@ class CarbonLensService:
     def list_connections(self) -> list[dict[str, str]]:
         return self.config_store.public_list()
 
+    @staticmethod
+    def _configured_workspace_schema(config: Any) -> str:
+        schema = str(config.write_workspace_schema or "").strip()
+        if not schema or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", schema):
+            raise CarbonLensError(
+                "workspace schema must be one configured identifier; arbitrary schema names are not accepted"
+            )
+        return schema
+
+    def workspace_schema_status(self, connection: str, timeout_seconds: int | None = None) -> dict[str, Any]:
+        """Check only the configured workspace schema using one read-only query."""
+        config = self.config_store.get(connection)
+        schema = self._configured_workspace_schema(config)
+        result = self.query(
+            connection,
+            "SHOW DATABASES",
+            limit=min(config.max_rows, 10000),
+            timeout_seconds=timeout_seconds,
+        )
+        names: set[str] = set()
+        for row in result.get("rows", []):
+            if not isinstance(row, dict):
+                continue
+            for key, value in row.items():
+                if str(key).casefold() in {"databasename", "database", "schema", "schemaname"}:
+                    names.add(str(value).strip().casefold())
+                    break
+        exists: bool | None = schema.casefold() in names
+        if result.get("truncated") and not exists:
+            exists = None
+        return {
+            "connection": connection,
+            "workspace_schema": schema,
+            "exists": exists,
+            "read_only": True,
+            "returned_row_count": result.get("returned_row_count", 0),
+            "truncated": bool(result.get("truncated")),
+            "elapsed_ms": result.get("elapsed_ms"),
+        }
+
+    def create_workspace_schema(
+        self,
+        connection: str,
+        confirm: bool = False,
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """Plan or create only the configured workspace schema.
+
+        This method intentionally accepts no SQL or schema argument.  A caller
+        must explicitly set ``confirm=True`` to execute the generated DDL.
+        """
+        config = self.config_store.get(connection)
+        schema = self._configured_workspace_schema(config)
+        sql = f"CREATE DATABASE IF NOT EXISTS {schema}"
+        planned = {
+            "connection": connection,
+            "workspace_schema": schema,
+            "sql": sql,
+            "confirmed": bool(confirm),
+            "executed": False,
+        }
+        if not confirm:
+            planned["status"] = "planned"
+            return planned
+        timeout = (
+            config.default_timeout
+            if timeout_seconds is None
+            else max(1, min(int(timeout_seconds), MAX_TIMEOUT_SECONDS))
+        )
+        started = time.monotonic()
+        remote_sql = f"{config.remote_tmp_dir.rstrip('/')}/carbon-lens-schema-{uuid.uuid4().hex}.sql"
+        with connect(config) as session:
+            session.upload_text(remote_sql, sql)
+            try:
+                stdin, stdout, stderr = session.exec(
+                    build_script(config, remote_sql),
+                    timeout,
+                    get_pty=False,
+                )
+                if stdin is not None:
+                    if config.root_password:
+                        stdin.write(config.root_password + "\n")
+                        stdin.flush()
+                    stdin.close()
+                _bounded_text(stdout, config.max_output_bytes)
+                error_output = stderr.read().decode("utf-8", errors="replace") if stderr is not None else ""
+                status = session.wait_exit(stdout, timeout)
+                if status != 0:
+                    detail = error_output.strip()[-4000:] or f"exit code {status}"
+                    raise CarbonLensError(f"Carbon workspace schema creation failed: {detail}")
+            finally:
+                session.remove(remote_sql)
+
+        return {
+            **planned,
+            "status": "succeeded",
+            "executed": True,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+
     def query(
         self,
         connection: str,

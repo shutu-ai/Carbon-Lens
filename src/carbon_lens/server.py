@@ -59,6 +59,26 @@ def carbon_list_connections() -> list[dict[str, str]]:
 
 
 @app.tool()
+def carbon_workspace_schema_status(connection: str, timeout_seconds: int | None = None) -> dict[str, Any]:
+    """Check whether the configured CarbonLens workspace schema exists."""
+    return service().workspace_schema_status(connection, timeout_seconds=timeout_seconds)
+
+
+@app.tool()
+def carbon_workspace_schema_create(
+    connection: str,
+    confirm: bool = False,
+    timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Plan or explicitly create only the configured CarbonLens workspace schema."""
+    return service().create_workspace_schema(
+        connection,
+        confirm=confirm,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+@app.tool()
 def carbon_query(connection: str, sql: str, limit: int = 100, timeout_seconds: int | None = None) -> dict[str, Any]:
     """Run one bounded read-only Carbon SQL query through SSH and fiber-beeline."""
     return service().query(connection, sql, limit=limit, timeout_seconds=timeout_seconds)

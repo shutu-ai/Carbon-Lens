@@ -26,7 +26,7 @@
       "max_output_bytes": 104857600,
       "write_workspace": {
         "enabled": false,
-        "schema": "carbon_lens_workspace",
+        "schema": "carbon_lens",
         "table_prefix": "cl_tmp_"
       }
     }
