@@ -2,7 +2,9 @@
 
 本文用于在一台新的 Windows 机器上首次部署 CarbonLens MCP，并接入 Codex 或其它本地 Agent。
 
-本项目的 MCP 使用 `stdio` 传输：Agent 启动一个本地 Python 进程，通过标准输入输出调用 CarbonLens 工具。MCP 进程本身再通过 SSH 连接 Carbon 主机，调用远端的 `fiber-beeline`。
+本项目支持 `stdio` 和 Streamable HTTP 两种 MCP 传输：stdio 由 Agent 启动本地
+Python 进程；HTTP 由独立常驻 Python 进程服务多个客户端。两种传输都通过同一
+CarbonLens 工具和 SSH/CarbonData 后端。
 
 ## 1. 部署前检查
 
@@ -152,6 +154,51 @@ $env:CARBON_LENS_WATCH_PARENT = '1'
 ```
 
 该保护只负责本机 MCP 进程，不会取消已经通过 `carbon_query_start` 提交到 Carbon 主机的 detached 查询任务。远程任务仍需使用 `carbon_query_cancel` 显式取消。
+
+## 6.2 启动 Streamable HTTP 常驻服务
+
+HTTP 服务不使用 stdio 的父进程监控，不会因为一个客户端断开而退出；同一个配置
+文件只允许一个 HTTP 服务进程持有稳定实例锁。默认只监听 loopback：
+
+```powershell
+$env:CARBON_LENS_CONFIG = 'D:\apps\carbon-lens\config.json'
+& 'D:\apps\carbon-lens\.venv\Scripts\python.exe' `
+  'D:\apps\carbon-lens\run_mcp.py' serve `
+  --transport streamable-http --host 127.0.0.1 --port 8765 --path /mcp
+```
+
+启动检查：
+
+```powershell
+Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8765/healthz'
+$env:CARBON_LENS_MCP_URL = 'http://127.0.0.1:8765/mcp'
+& 'D:\apps\carbon-lens\.venv\Scripts\python.exe' `
+  'D:\apps\carbon-lens\scripts\streamable_http_smoke.py'
+```
+
+Linux 运行方式：
+
+```bash
+export CARBON_LENS_CONFIG=/srv/carbon-lens/config.json
+/srv/carbon-lens/.venv/bin/python /srv/carbon-lens/run_mcp.py serve \
+  --transport streamable-http --host 127.0.0.1 --port 8765 --path /mcp
+```
+
+内网绑定必须设置共享 token，并限制 Host；例如：
+
+```powershell
+$env:CARBON_LENS_HTTP_ACCESS_TOKEN = '<set outside source control>'
+& '.\.venv\Scripts\python.exe' '.\run_mcp.py' serve `
+  --transport streamable-http --host 0.0.0.0 --port 8765 --path /mcp `
+  --public-base-url 'http://carbon-lens.internal:8765' `
+  --allowed-host 'carbon-lens.internal:*'
+```
+
+客户端只需配置 `http://127.0.0.1:8765/mcp` 或可信内网 URL，不需要配置目标
+SSH 密钥或 Kerberos。远程 `carbon_export_status` 成功后会给出按 export ID
+生成的 `download_url`；用同一 bearer token GET 该 URL 可重复下载文件，不会重新
+执行 SQL。HTTP 配置的 JSON 占位项见 `config.example.json`，也可用
+`CARBON_LENS_HTTP_*` 环境变量或 CLI 参数覆盖。
 
 ## 7. 接入 Codex
 

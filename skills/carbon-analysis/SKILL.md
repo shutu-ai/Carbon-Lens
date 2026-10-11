@@ -56,12 +56,16 @@ SSH passwords, private keys, keytabs, or other credentials into the conversation
    `succeeded`. A download failure remains retryable through the same
    `export_id` and does not rerun the SQL. Use `carbon_export_list` for export
    history and `carbon_export_cancel` to request remote cancellation.
-10. Explain where the exported file will be available. CSV is generated on the
-   Carbon host and transferred by SFTP to the MCP server's configured
-   `export_dir`; JSON is written there from a bounded in-memory query. The tool
-   returns the MCP server's file path, columns, row count, and truncation status.
-   It does not itself download the file to the user's computer; do not claim it
-   does. If that path is not accessible to the user, state the limitation.
+10. Explain where the exported file will be available. In stdio mode CSV is
+   generated on the Carbon host and transferred by SFTP to the MCP server's
+   configured `export_dir`; JSON is written there from a bounded in-memory
+   query. In Streamable HTTP mode, a successful status may include
+   `download_available` and a server-generated `download_url`; fetch that URL
+   with the same bearer token when configured. The URL is tied to the
+   `export_id`, streams the existing file, and does not rerun SQL. If no trusted
+   `public_base_url` is configured, use the known MCP server origin plus
+   `/exports/{export_id}/download` rather than inventing a host from request
+   headers. Do not claim a server-side path is already on the user's device.
 11. For JSON exports, report `truncated` when true and do not present a capped
    result as complete. CSV exports report `truncated: "unknown"` when the
    bounded result reaches the effective limit, because an exact cap cannot

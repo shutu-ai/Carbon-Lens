@@ -1,16 +1,22 @@
 # CarbonLens MCP 配置说明
 
-本文说明如何在 Codex、Claude Desktop、Cursor、VS Code 等 Agent 中使用本地 CarbonLens MCP 服务。
+本文说明如何在 Codex、Claude Desktop、Cursor、VS Code 等 Agent 中使用本地
+stdio 或独立 Streamable HTTP CarbonLens MCP 服务。
 
 ## 1. MCP 服务信息
 
-CarbonLens 当前使用 `stdio` 方式启动 MCP 服务。服务入口和运行配置如下：
+CarbonLens 支持两种 MCP Transport。stdio 适合 Agent 在本机拉起进程；
+Streamable HTTP 适合一个常驻服务供多个客户端共享。两者使用同一工具注册表和
+后端连接配置。
 
 | 项目 | 路径 |
 | --- | --- |
 | Python 解释器 | `D:\dev-projects\carbon-lens\.venv\Scripts\python.exe` |
 | MCP 入口 | `D:\dev-projects\carbon-lens\run_mcp.py` |
 | CarbonLens 配置 | `D:\dev-projects\carbon-lens\config.json` |
+
+HTTP 的默认值也可写在 `config.json` 的顶层 `http` 对象中，或由命令行/环境变量
+覆盖；占位示例见 `config.example.json`。HTTP 默认只监听 `127.0.0.1`。
 
 `config.json` 中包含 SSH 连接、Carbon 客户端、Kerberos、导出目录等运行参数。该文件可能包含明文凭据，应限制访问权限，不要提交到公共代码仓库。
 
@@ -140,9 +146,42 @@ CarbonLens 会按 `CARBON_LENS_CONFIG` 和父 Agent 进程对 MCP 进程加单�
 如果 Agent 在远程主机、容器或云端运行：
 
 - 远程环境必须拥有 MCP 源码、Python 依赖、`config.json` 和 SSH 网络连通性；或
-- 将 MCP 服务改造成可访问的 Streamable HTTP 服务，再使用 URL 配置。
+- 启动 Streamable HTTP 服务，再使用 URL 配置；客户端不需要目标 SSH 密钥或 Kerberos 凭据。
 
 远程 Agent 不能直接读取本机的 `D:` 盘路径。
+
+### Streamable HTTP 服务与客户端
+
+Windows PowerShell：
+
+```powershell
+Set-Location 'D:\apps\carbon-lens'
+$env:CARBON_LENS_CONFIG = 'D:\apps\carbon-lens\config.json'
+& '.\.venv\Scripts\python.exe' '.\run_mcp.py' serve `
+  --transport streamable-http --host 127.0.0.1 --port 8765 --path /mcp
+```
+
+Linux：
+
+```bash
+export CARBON_LENS_CONFIG=/srv/carbon-lens/config.json
+/srv/carbon-lens/.venv/bin/python /srv/carbon-lens/run_mcp.py serve \
+  --transport streamable-http --host 127.0.0.1 --port 8765 --path /mcp
+```
+
+Codex 的 URL 型 MCP 配置（字段由当前 Codex CLI 支持）：
+
+```toml
+[mcp_servers.carbon_lens]
+url = "http://127.0.0.1:8765/mcp"
+```
+
+内网绑定必须在服务端设置 `CARBON_LENS_HTTP_ACCESS_TOKEN`，并使用例如
+`--allowed-host 'carbon-lens.internal:*' --public-base-url
+'http://carbon-lens.internal:8765'`。不要把 token 写入 TOML、截图、日志或 Git。
+服务健康检查为 `GET /healthz`。导出完成后，HTTP 工具结果会提供
+`download_url`；客户端用同一个 bearer token 对该 URL 发起 GET，可重复下载同一个
+文件而不重新执行 SQL。
 
 ## 8. 安全要求
 

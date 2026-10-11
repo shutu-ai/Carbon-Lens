@@ -73,6 +73,21 @@ class InstanceLock:
         lock_path = Path(tempfile.gettempdir()) / f"carbon-lens-mcp-{digest}.lock"
         return cls(lock_path, resolved_config)
 
+    @classmethod
+    def for_http(cls, config_path: str | Path | None = None) -> "InstanceLock":
+        """Return a stable lock for the long-lived HTTP service.
+
+        Unlike stdio, an HTTP server must not derive ownership from its
+        launching parent PID: clients may disconnect and the launcher may be
+        short-lived while the server continues serving other clients.
+        """
+        configured = config_path or os.environ.get("CARBON_LENS_CONFIG") or "config.json"
+        resolved_config = Path(configured).expanduser().resolve()
+        identity = f"{os.path.normcase(str(resolved_config))}\0http".encode("utf-8")
+        digest = hashlib.sha256(identity).hexdigest()[:32]
+        lock_path = Path(tempfile.gettempdir()) / f"carbon-lens-http-{digest}.lock"
+        return cls(lock_path, resolved_config)
+
     def acquire(self) -> None:
         if self._handle is not None:
             return

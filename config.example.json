@@ -1,12 +1,22 @@
 {
+  "http": {
+    "transport": "streamable-http",
+    "host": "127.0.0.1",
+    "port": 8765,
+    "path": "/mcp",
+    "public_base_url": "",
+    "access_token_env": "CARBON_LENS_HTTP_ACCESS_TOKEN",
+    "allowed_hosts": ["127.0.0.1:*", "localhost:*", "[::1]:*"],
+    "allowed_origins": ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+  },
   "connections": {
     "carbon-prod": {
       "carbon_transport": "beeline",
       "connection_mode": "ssh",
       "ssh_config": {
-        "hostname": "10.125.189.196",
+        "hostname": "carbon-host.example.internal",
         "port": 22,
-        "username": "paas",
+        "username": "carbon_ssh_user",
         "password_env": "CARBON_LENS_SSH_PASSWORD",
         "known_hosts": "keys/known_hosts"
       },
@@ -17,8 +27,8 @@
       "env_script": "/opt/client/bigdata_env",
       "beeline_path": "/opt/client/Fiber/bin/fiber-beeline",
       "beeline_connection": "Carbon_Query_XDR",
-      "principal": "ossuser",
-      "keytab": "/opt/client/keytab/ossuser.keytab",
+      "principal": "carbon_user@EXAMPLE.REALM",
+      "keytab": "/path/to/carbon_user.keytab",
       "remote_tmp_dir": "/tmp",
       "export_dir": "exports",
       "timeout_seconds": 600,

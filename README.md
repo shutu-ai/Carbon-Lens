@@ -64,6 +64,52 @@ Configure Codex to launch that command as a stdio MCP server. Keep
 `carbon_workspace_create_start`, `carbon_workspace_create`,
 `carbon_workspace_schema_status`, and `carbon_workspace_schema_create`.
 
+## Run as a Streamable HTTP MCP server
+
+The same tool registry can run as an independent, long-lived MCP service. The
+default is loopback-only and does not require a token:
+
+```powershell
+& '.\.venv\Scripts\python.exe' '.\run_mcp.py' serve `
+  --transport streamable-http --host 127.0.0.1 --port 8765 --path /mcp
+```
+
+```bash
+CARBON_LENS_CONFIG=/srv/carbon-lens/config.json \
+  /srv/carbon-lens/.venv/bin/python /srv/carbon-lens/run_mcp.py serve \
+  --transport streamable-http --host 127.0.0.1 --port 8765 --path /mcp
+```
+
+The MCP URL is `http://127.0.0.1:8765/mcp`. A remote/private-network bind
+requires a shared bearer token and a trusted public URL:
+
+```powershell
+$env:CARBON_LENS_HTTP_ACCESS_TOKEN = '<set outside source control>'
+& '.\.venv\Scripts\python.exe' '.\run_mcp.py' serve `
+  --transport streamable-http --host 0.0.0.0 --port 8765 --path /mcp `
+  --public-base-url 'http://carbon-lens.internal:8765' `
+  --allowed-host 'carbon-lens.internal:*'
+```
+
+The server owns the SSH/Kerberos configuration; HTTP clients only need the MCP
+URL and, when enabled, the bearer token. `/healthz` is a lightweight process
+check and does not issue SSH or Carbon SQL. Background query/export IDs and the
+SQLite job database remain server-side and survive client disconnects. A
+completed HTTP export includes a trusted `download_url`; `GET
+/exports/{export_id}/download` streams the existing file and never reruns SQL.
+
+```text
+MCP client -- stdio or Streamable HTTP --> CarbonLens tools
+                                          -> shared jobs / SQLite
+                                          -> local Beeline or SSH/Jump Host
+                                          -> CarbonData / SFTP
+```
+
+Do not expose a wildcard bind directly to the public internet. For a remote
+bind, set `CARBON_LENS_HTTP_ACCESS_TOKEN` in the service environment, restrict
+`--allowed-host`/`--allowed-origin` as appropriate, and use TLS at the trusted
+reverse proxy or private network boundary.
+
 Query and export commands use a 10-minute default timeout. Each call may set
 `timeout_seconds` up to 7200 seconds (2 hours); the configured connection value
 in `timeout_seconds` controls the default when the tool argument is omitted.

@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import os
 import sys
+import argparse
+import ipaddress
+import json
+from pathlib import Path
+import socket
+from threading import Lock
 from typing import Any
 
 try:
@@ -16,39 +22,50 @@ from .exports import ExportJobManager
 from .executions import WriteExecutionManager
 from .lifecycle import InstanceAlreadyRunning, InstanceLock, ParentProcessMonitor
 from .service import CarbonLensService
+from .http import HTTPServerSettings, build_http_app
 
 app = FastMCP("carbon-lens")
 _service: CarbonLensService | None = None
 _query_jobs: QueryJobManager | None = None
 _export_jobs: ExportJobManager | None = None
 _write_executions: WriteExecutionManager | None = None
+_manager_lock = Lock()
+_http_settings: HTTPServerSettings | None = None
 
 
 def service() -> CarbonLensService:
     global _service
     if _service is None:
-        _service = CarbonLensService()
+        with _manager_lock:
+            if _service is None:
+                _service = CarbonLensService()
     return _service
 
 
 def query_jobs() -> QueryJobManager:
     global _query_jobs
     if _query_jobs is None:
-        _query_jobs = QueryJobManager(service)
+        with _manager_lock:
+            if _query_jobs is None:
+                _query_jobs = QueryJobManager(service)
     return _query_jobs
 
 
 def export_jobs() -> ExportJobManager:
     global _export_jobs
     if _export_jobs is None:
-        _export_jobs = ExportJobManager(service)
+        with _manager_lock:
+            if _export_jobs is None:
+                _export_jobs = ExportJobManager(service)
     return _export_jobs
 
 
 def write_executions() -> WriteExecutionManager:
     global _write_executions
     if _write_executions is None:
-        _write_executions = WriteExecutionManager(service)
+        with _manager_lock:
+            if _write_executions is None:
+                _write_executions = WriteExecutionManager(service)
     return _write_executions
 
 
@@ -128,26 +145,28 @@ def carbon_export_start(
     timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Start a background export and download the completed file to export_dir."""
-    return export_jobs().submit(
+    return _export_http_metadata(export_jobs().submit(
         connection,
         sql,
         format=format,
         filename=filename,
         limit=limit,
         timeout_seconds=timeout_seconds,
-    )
+    ))
 
 
 @app.tool()
 def carbon_export_status(export_id: str) -> dict[str, Any]:
     """Refresh a background export and return its local file status and path."""
-    return export_jobs().status(export_id)
+    return _export_http_metadata(export_jobs().status(export_id))
 
 
 @app.tool()
 def carbon_export_list(status: str | None = None, limit: int = 50) -> dict[str, Any]:
     """List persisted background export jobs without issuing Carbon SQL."""
-    return export_jobs().list_jobs(status=status, limit=limit)
+    result = export_jobs().list_jobs(status=status, limit=limit)
+    result["exports"] = [_export_http_metadata(item) for item in result["exports"]]
+    return result
 
 
 @app.tool()
@@ -258,7 +277,129 @@ def carbon_export(
     )
 
 
-def main() -> None:
+def _export_http_metadata(result: dict[str, Any]) -> dict[str, Any]:
+    if _http_settings is None:
+        return result
+    export_id = str(result.get("export_id") or "")
+    base_url = _http_settings.base_url
+    available = result.get("status") == "succeeded"
+    if available:
+        try:
+            available = export_jobs().download_info(export_id)["path"].is_file()
+        except Exception:
+            available = False
+    result = dict(result)
+    result["download_available"] = bool(available)
+    result["download_url"] = (
+        f"{base_url}/exports/{export_id}/download" if available and base_url else None
+    )
+    return result
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="carbon-lens", description="CarbonLens MCP server")
+    subparsers = parser.add_subparsers(dest="command")
+    serve = subparsers.add_parser("serve", help="run a long-lived MCP Streamable HTTP server")
+    serve.add_argument("--transport", choices=("streamable-http",), default="streamable-http")
+    serve.add_argument("--host")
+    serve.add_argument("--port", type=int)
+    serve.add_argument("--path")
+    serve.add_argument("--public-base-url")
+    serve.add_argument("--access-token", default="")
+    serve.add_argument("--access-token-env")
+    serve.add_argument("--allowed-host", action="append")
+    serve.add_argument("--allowed-origin", action="append")
+    serve.add_argument("--log-level")
+    return parser
+
+
+def _http_config_defaults() -> dict[str, Any]:
+    configured = os.environ.get("CARBON_LENS_CONFIG") or "config.json"
+    path = Path(configured).expanduser()
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unable to read HTTP settings from CARBON_LENS_CONFIG: {exc}") from exc
+    http = payload.get("http") if isinstance(payload, dict) else None
+    return dict(http) if isinstance(http, dict) else {}
+
+
+def _http_settings_from_args(args: argparse.Namespace) -> HTTPServerSettings:
+    configured = _http_config_defaults()
+    host = str(args.host or os.environ.get("CARBON_LENS_HTTP_HOST") or configured.get("host") or "127.0.0.1").strip()
+    port = int(args.port or os.environ.get("CARBON_LENS_HTTP_PORT") or configured.get("port") or 8765)
+    path = str(args.path or os.environ.get("CARBON_LENS_HTTP_PATH") or configured.get("path") or "/mcp").strip()
+    if not path.startswith("/") or "?" in path or "#" in path:
+        raise ValueError("--path must be an absolute URL path without query or fragment")
+    if not 1 <= port <= 65535:
+        raise ValueError("--port must be between 1 and 65535")
+    token_env = str(
+        args.access_token_env
+        or os.environ.get("CARBON_LENS_HTTP_ACCESS_TOKEN_ENV")
+        or configured.get("access_token_env")
+        or "CARBON_LENS_HTTP_ACCESS_TOKEN"
+    )
+    token = os.environ.get(token_env, "").strip() or str(args.access_token or configured.get("access_token") or "").strip()
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = host.casefold() == "localhost"
+    if not is_loopback and not token:
+        raise ValueError("non-loopback HTTP binds require --access-token or the configured token environment variable")
+    configured_hosts = configured.get("allowed_hosts") or []
+    configured_origins = configured.get("allowed_origins") or []
+    allowed_hosts = tuple(args.allowed_host or configured_hosts or (["127.0.0.1:*", "localhost:*", "[::1]:*"] if is_loopback else []))
+    allowed_origins = tuple(args.allowed_origin or configured_origins or (["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"] if is_loopback else []))
+    if not is_loopback and not allowed_hosts:
+        # Wildcard binds still accept private IP Host headers through the
+        # middleware; explicit names can be added with --allowed-host.
+        allowed_hosts = (f"{host}:*",) if host not in {"0.0.0.0", "::"} else ()
+    return HTTPServerSettings(
+        host=host,
+        port=port,
+        path=path,
+        public_base_url=str(args.public_base_url or os.environ.get("CARBON_LENS_HTTP_PUBLIC_BASE_URL") or configured.get("public_base_url") or "").strip(),
+        access_token=token,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+        log_level=str(args.log_level or os.environ.get("CARBON_LENS_HTTP_LOG_LEVEL") or configured.get("log_level") or "INFO").upper(),
+    )
+
+
+def _run_http(settings: HTTPServerSettings) -> None:
+    global _http_settings
+    import anyio
+    import uvicorn
+
+    try:
+        probe = socket.create_server((settings.host, settings.port), backlog=1)
+    except OSError as exc:
+        raise OSError(f"HTTP bind failed for {settings.host}:{settings.port}: {exc}") from exc
+    else:
+        probe.close()
+    _http_settings = settings
+    http_app = build_http_app(app, settings, export_jobs)
+    server = uvicorn.Server(
+        uvicorn.Config(http_app, host=settings.host, port=settings.port, log_level=settings.log_level.lower())
+    )
+    lock = InstanceLock.for_http()
+    with lock:
+        anyio.run(server.serve)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parser().parse_args(argv)
+    if args.command == "serve":
+        try:
+            _run_http(_http_settings_from_args(args))
+        except KeyboardInterrupt:
+            return
+        except (InstanceAlreadyRunning, ValueError, OSError) as exc:
+            print(f"CarbonLens HTTP startup failed: {exc}", file=sys.stderr, flush=True)
+            raise SystemExit(16) from exc
+        return
     parent_pid = os.getppid()
     instance_lock = InstanceLock.for_config(parent_pid=parent_pid)
     try:

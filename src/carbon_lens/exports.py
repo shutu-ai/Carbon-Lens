@@ -36,6 +36,16 @@ TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 KNOWN_STATUSES = {"queued", "starting", "running", "downloading", "cancel_requested", *TERMINAL_STATUSES}
 
 
+class ExportDownloadError(CarbonLensError):
+    """A safe, classified error for the HTTP export download endpoint."""
+
+    def __init__(self, status_code: int, code: str, message: str, export_id: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.export_id = export_id
+
+
 def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -148,6 +158,52 @@ class ExportJobManager:
             if row["status"] in TERMINAL_STATUSES:
                 return self._snapshot(row)
             return self._refresh_remote(row)
+
+    def download_info(self, export_id: str) -> dict[str, Any]:
+        """Return a validated completed export file for HTTP streaming.
+
+        This method never starts or refreshes a Carbon job.  The export ID is
+        resolved through the persisted row, and the resulting path is checked
+        against that connection's configured export directory.
+        """
+        if not export_id or not export_id.startswith("ce_"):
+            raise ExportDownloadError(404, "unknown_export_id", "unknown export_id", export_id or "")
+        with self._lock:
+            try:
+                row = self._get_job(export_id)
+            except CarbonLensError as exc:
+                raise ExportDownloadError(404, "unknown_export_id", "unknown export_id", export_id) from exc
+            if row["status"] != "succeeded":
+                raise ExportDownloadError(
+                    409,
+                    "not_ready",
+                    f"export is not ready for download (status={row['status']})",
+                    export_id,
+                )
+            config = self._service_factory().config_store.get(row["connection"])
+            export_dir = Path(config.export_dir).resolve()
+            path = Path(row["local_path"]).resolve()
+            if export_dir not in path.parents:
+                raise ExportDownloadError(
+                    500,
+                    "invalid_export_path",
+                    "persisted export path is outside the configured export directory",
+                    export_id,
+                )
+            if not path.is_file():
+                raise ExportDownloadError(
+                    410,
+                    "file_missing",
+                    "export succeeded but file is missing or expired",
+                    export_id,
+                )
+            return {
+                "export_id": export_id,
+                "path": path,
+                "filename": Path(row["filename"]).name,
+                "format": row["format"],
+                "file_size": path.stat().st_size,
+            }
 
     def list_jobs(self, status: str | None = None, limit: int = 50) -> dict[str, Any]:
         if status is not None and status not in KNOWN_STATUSES:
