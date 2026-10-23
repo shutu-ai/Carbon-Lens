@@ -34,6 +34,7 @@ ASYNC_QUERY_TTL_SECONDS = 30 * 24 * 60 * 60
 REMOTE_QUERY_TTL_SECONDS = 2 * 24 * 60 * 60
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 KNOWN_STATUSES = {"queued", "starting", "running", "cancel_requested", *TERMINAL_STATUSES}
+ACTIVE_STATUSES = {"queued", "starting", "running", "cancel_requested"}
 
 
 def _timestamp() -> str:
@@ -46,6 +47,7 @@ class QueryJobManager:
     def __init__(self, service_factory: Callable[[], CarbonLensService]):
         self._service_factory = service_factory
         service = service_factory()
+        self.instance_id = getattr(service, "instance_id", f"pid-{os.getpid()}-{uuid.uuid4().hex[:10]}")
         configured = os.environ.get("CARBON_LENS_JOB_DB", "").strip()
         database = Path(configured).expanduser() if configured else service.config_store.path.parent / ".carbon-lens-jobs.sqlite3"
         if not database.is_absolute():
@@ -94,6 +96,7 @@ class QueryJobManager:
                     "finished_epoch": None,
                     "remote_dir": remote_dir,
                     "remote_pid": None,
+                    "owner_instance_id": self.instance_id,
                     "result_path": str(result_path),
                     "result_meta_json": None,
                     "result_json": None,
@@ -169,7 +172,56 @@ class QueryJobManager:
                 "jobs": [self._snapshot(row, include_result=False) for row in rows],
                 "count": int(count),
                 "returned_count": len(rows),
+                "manager_instance_id": self.instance_id,
             }
+
+    def reconcile(self, limit: int = 50) -> dict[str, Any]:
+        """Refresh active jobs and converge stale remote state.
+
+        A transient failure while checking one job is reported for that job,
+        but does not overwrite its local state.  This prevents a temporary
+        status-channel outage from turning an active remote query into a false
+        terminal failure.
+        """
+        limit = max(1, min(int(limit), 100))
+        with self._lock:
+            self._prune_jobs()
+            conn = self._connect_db()
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM query_jobs WHERE status IN (?, ?, ?, ?) "
+                    "ORDER BY created_epoch ASC LIMIT ?",
+                    (*sorted(ACTIVE_STATUSES), limit),
+                ).fetchall()
+            finally:
+                conn.close()
+
+        reconciled: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for row in rows:
+            query_id = str(row["query_id"])
+            try:
+                reconciled.append(self.status(query_id))
+            except Exception as exc:
+                snapshot = self._snapshot(self._get_job(query_id), include_result=False)
+                snapshot["reconcile_error"] = f"{type(exc).__name__}: {exc}"
+                reconciled.append(snapshot)
+                errors.append(
+                    {
+                        "query_id": query_id,
+                        "error": snapshot["reconcile_error"],
+                    }
+                )
+
+        active_after = self._count_active_jobs()
+        return {
+            "manager_instance_id": self.instance_id,
+            "reconciled_count": len(reconciled),
+            "active_before": len(rows),
+            "active_after": active_after,
+            "errors": errors,
+            "jobs": reconciled,
+        }
 
     def cancel(self, query_id: str) -> dict[str, Any]:
         with self._lock:
@@ -388,6 +440,7 @@ class QueryJobManager:
                     finished_epoch REAL,
                     remote_dir TEXT NOT NULL,
                     remote_pid TEXT,
+                    owner_instance_id TEXT,
                     result_path TEXT,
                     result_meta_json TEXT,
                     result_json TEXT,
@@ -399,6 +452,7 @@ class QueryJobManager:
             )
             self._ensure_column(conn, "query_jobs", "result_path", "TEXT")
             self._ensure_column(conn, "query_jobs", "result_meta_json", "TEXT")
+            self._ensure_column(conn, "query_jobs", "owner_instance_id", "TEXT")
             conn.commit()
         finally:
             conn.close()
@@ -407,6 +461,18 @@ class QueryJobManager:
         conn = sqlite3.connect(str(self._db_path), timeout=30)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _count_active_jobs(self) -> int:
+        conn = self._connect_db()
+        try:
+            placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM query_jobs WHERE status IN ({placeholders})",
+                tuple(sorted(ACTIVE_STATUSES)),
+            ).fetchone()
+            return int(row[0])
+        finally:
+            conn.close()
 
     def _insert_job(self, values: dict[str, Any]) -> None:
         conn = self._connect_db()
@@ -417,15 +483,15 @@ class QueryJobManager:
                     query_id, connection, sql, requested_limit, effective_limit,
                     requested_timeout_seconds, effective_timeout_seconds, status,
                     created_at, created_epoch, started_at, started_epoch,
-                    finished_at, finished_epoch, remote_dir, remote_pid,
+                    finished_at, finished_epoch, remote_dir, remote_pid, owner_instance_id,
                     result_path, result_meta_json, result_json, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 tuple(values[key] for key in (
                     "query_id", "connection", "sql", "requested_limit", "effective_limit",
                     "requested_timeout_seconds", "effective_timeout_seconds", "status",
                     "created_at", "created_epoch", "started_at", "started_epoch",
-                    "finished_at", "finished_epoch", "remote_dir", "remote_pid",
+                    "finished_at", "finished_epoch", "remote_dir", "remote_pid", "owner_instance_id",
                     "result_path", "result_meta_json", "result_json", "error",
                 )),
             )
@@ -522,6 +588,7 @@ class QueryJobManager:
         snapshot = {
             "query_id": row["query_id"],
             "connection": row["connection"],
+            "owner_instance_id": row["owner_instance_id"],
             "sql": row["sql"],
             "requested_limit": row["requested_limit"],
             "effective_limit": row["effective_limit"],

@@ -1,0 +1,44 @@
+MCP 包安装步骤（Windows）：
+
+Expand-Archive `
+  -LiteralPath '.\carbon-lens-mcp-0.1.2.zip' `
+  -DestinationPath 'D:\opt\CarbonLens' `
+  -Force
+
+cd 'D:\opt\CarbonLens\carbon-lens-mcp'
+
+py -3 -m venv .venv
+& '.\.venv\Scripts\python.exe' -m pip install --upgrade pip
+& '.\.venv\Scripts\python.exe' -m pip install .
+Copy-Item config.example.json config.json
+
+然后编辑 config.json，填入真实 SSH、Kerberos、Beeline 和导出目录配置。
+
+stdio 启动：
+
+$env:CARBON_LENS_CONFIG = (Join-Path (Get-Location) 'config.json')
+& '.\.venv\Scripts\python.exe' run_mcp.py
+
+Streamable HTTP 启动：
+
+$env:CARBON_LENS_CONFIG = (Join-Path (Get-Location) 'config.json')
+
+& '.\.venv\Scripts\python.exe' run_mcp.py serve `
+  --transport streamable-http `
+  --host 127.0.0.1 `
+  --port 8765 `
+  --path /mcp
+
+MCP 地址：
+
+http://127.0.0.1:8765/mcp
+
+
+Codex的config.toml中增加以下配置：
+[mcp_servers.carbon-lens]
+command = 'D:\opt\carbon-lens\.venv\Scripts\python.exe'
+args = ['D:\opt\carbon-lens\run_mcp.py']
+
+[mcp_servers.carbon-lens.env]
+CARBON_LENS_CONFIG = 'D:\opt\carbon-lens\config.json'
+CARBON_LENS_WATCH_PARENT = '0'

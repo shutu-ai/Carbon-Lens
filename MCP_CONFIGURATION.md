@@ -106,7 +106,7 @@ VS Code 也支持项目根目录的便携格式 `.mcp.json`，该格式使用顶
 
 ## 5. 使用打包文件时的路径调整
 
-解压 [MCP 包](packages/carbon-lens-mcp-0.1.1.zip) 后，应根据实际解压位置修改三个路径：
+解压 [MCP 包](packages/carbon-lens-mcp-0.1.2.zip) 后，应根据实际解压位置修改三个路径：
 
 1. `command` 指向解压目录下虚拟环境的 Python，或目标机器上的 Python。
 2. `args` 指向解压目录下的 `run_mcp.py`。

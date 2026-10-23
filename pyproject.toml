@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "carbon-lens"
-version = "0.1.1"
+version = "0.1.2"
 description = "Read-only CarbonData analysis and export MCP server over SSH"
 requires-python = ">=3.11"
 dependencies = [

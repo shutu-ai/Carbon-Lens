@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import time
 import uuid
@@ -23,6 +24,38 @@ from .beeline import (
 )
 from .config import MAX_TIMEOUT_SECONDS, CarbonLensError, ConfigStore
 from .ssh import connect
+
+
+DEFAULT_HEALTH_TIMEOUT_SECONDS = 60
+
+
+def _health_error_details(exc: BaseException) -> tuple[str, str, bool]:
+    """Classify a health-probe failure without hiding the original error."""
+    text = str(exc)
+    folded = text.casefold()
+    if "ssh connection failed" in folded or "jump host" in folded:
+        phase = "ssh_connect"
+        error_code = (
+            "ssh_connect_timeout"
+            if "timed out" in folded or "timeout" in folded
+            else "ssh_connect_failed"
+        )
+        retryable = (
+            error_code == "ssh_connect_timeout"
+            or "connection reset" in folded
+            or "connection refused" in folded
+            or "connection was not established" in folded
+        )
+        return phase, error_code, retryable
+    if "remote carbon command failed to start" in folded:
+        return "ssh_command_start", "remote_command_start_failed", True
+    if "fiber-beeline" in folded or "remote job" in folded:
+        return "beeline", "beeline_failed", False
+    if "result read timed out" in folded or "query result read timed out" in folded:
+        return "read_result", "result_read_timeout", True
+    if "timed out" in folded or "timeout" in folded:
+        return "remote_command", "remote_command_timeout", True
+    return "query", "query_failed", False
 
 
 def _bounded_export_sql(sql: str, limit: int) -> str:
@@ -48,9 +81,59 @@ def _csv_summary(path: Path) -> tuple[list[str], int]:
 class CarbonLensService:
     def __init__(self, config_store: ConfigStore | None = None):
         self.config_store = config_store or ConfigStore()
+        self.instance_id = f"pid-{os.getpid()}-{uuid.uuid4().hex[:10]}"
 
     def list_connections(self) -> list[dict[str, str]]:
         return self.config_store.public_list()
+
+    def health_check(self, connection: str, timeout_seconds: int | None = None) -> dict[str, Any]:
+        """Run a fresh bounded read-only probe through SSH and Beeline.
+
+        This is intentionally a real Carbon query rather than a configuration
+        lookup.  Failures are returned as structured health data so an Agent
+        can distinguish a fresh transport failure from an old query record.
+        """
+        timeout = (
+            DEFAULT_HEALTH_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else max(1, min(int(timeout_seconds), MAX_TIMEOUT_SECONDS))
+        )
+        probe_sql = "SELECT 1 AS carbon_lens_health"
+        started = time.monotonic()
+        try:
+            result = self.query(
+                connection,
+                probe_sql,
+                limit=1,
+                timeout_seconds=timeout,
+            )
+        except Exception as exc:
+            phase, error_code, retryable = _health_error_details(exc)
+            return {
+                "connection": connection,
+                "mcp_instance_id": self.instance_id,
+                "ok": False,
+                "phase": phase,
+                "error_code": error_code,
+                "retryable": retryable,
+                "error": str(exc),
+                "probe_sql": probe_sql,
+                "timeout_seconds": timeout,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+            }
+        return {
+            "connection": connection,
+            "mcp_instance_id": self.instance_id,
+            "ok": True,
+            "phase": "result",
+            "transport": result.get("transport"),
+            "probe_sql": probe_sql,
+            "timeout_seconds": timeout,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "returned_row_count": result.get("returned_row_count"),
+            "truncated": bool(result.get("truncated")),
+            "connection_attempts": result.get("connection_attempts", 1),
+        }
 
     @staticmethod
     def _configured_workspace_schema(config: Any) -> str:
@@ -173,7 +256,9 @@ class CarbonLensService:
         )
         started = time.monotonic()
         remote_sql = f"{config.remote_tmp_dir.rstrip('/')}/carbon-lens-{uuid.uuid4().hex}.sql"
+        connection_attempts = 1
         with connect(config) as session:
+            connection_attempts = session.connection_attempts
             if session_callback is not None:
                 session_callback(session)
             if cancel_event is not None and cancel_event.is_set():
@@ -227,6 +312,7 @@ class CarbonLensService:
             "truncated": truncated,
             "type_info_unavailable": True,
             "elapsed_ms": elapsed_ms,
+            "connection_attempts": connection_attempts,
         }
 
     def describe(self, connection: str, table: str, timeout_seconds: int | None = None) -> dict[str, Any]:

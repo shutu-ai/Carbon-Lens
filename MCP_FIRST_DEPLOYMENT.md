@@ -27,7 +27,7 @@ CarbonLens 工具和 SSH/CarbonData 后端。
 
 ## 2. 解压 MCP 包
 
-将 [MCP 包](packages/carbon-lens-mcp-0.1.1.zip)复制到目标机器并解压。建议部署目录为：
+将 [MCP 包](packages/carbon-lens-mcp-0.1.2.zip)复制到目标机器并解压。建议部署目录为：
 
 ```text
 D:\apps\carbon-lens

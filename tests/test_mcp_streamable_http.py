@@ -86,8 +86,10 @@ def test_real_mcp_client_can_initialize_list_and_call_over_streamable_http(monke
         initialized, tools, called = asyncio.run(exercise())
         assert initialized.serverInfo.name == "carbon-lens"
         names = {tool.name for tool in tools.tools}
-        assert len(names) == 22
+        assert len(names) == 24
+        assert "carbon_health_check" in names
         assert "carbon_query_start" in names
+        assert "carbon_query_reconcile" in names
         assert not called.isError
         payloads = [json.loads(item.text) for item in called.content if hasattr(item, "text")]
         assert any(item["name"] == "test" for item in payloads)

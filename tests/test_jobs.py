@@ -6,7 +6,7 @@ import sqlite3
 import time
 import uuid
 
-from carbon_lens.config import ConnectionConfig
+from carbon_lens.config import CarbonLensError, ConnectionConfig
 from carbon_lens.jobs import QueryJobManager
 from carbon_lens.beeline import BEGIN_MARKER, END_MARKER
 
@@ -152,5 +152,55 @@ def test_running_query_is_failed_after_timeout(monkeypatch):
 
         assert failed["status"] == "failed"
         assert "did not complete" in failed["error"]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_reconcile_refreshes_active_jobs_and_converges_timeout(monkeypatch):
+    tmp_path = Path(__file__).resolve().parents[1] / (".test-query-reconcile-" + uuid.uuid4().hex)
+    tmp_path.mkdir(parents=True)
+    try:
+        service = FakeService(tmp_path)
+        session = RunningSession()
+        monkeypatch.setenv("CARBON_LENS_JOB_DB", str(tmp_path / "jobs.sqlite3"))
+        monkeypatch.setattr("carbon_lens.jobs.connect", lambda config: session)
+
+        manager = QueryJobManager(lambda: service)
+        queued = manager.submit("test", "SELECT 1", limit=1, timeout_seconds=1)
+        manager._update_job(queued["query_id"], started_epoch=time.time() - 1000)
+
+        result = manager.reconcile()
+
+        assert result["reconciled_count"] == 1
+        assert result["active_before"] == 1
+        assert result["active_after"] == 0
+        assert result["jobs"][0]["status"] == "failed"
+        assert result["jobs"][0]["owner_instance_id"] == manager.instance_id
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_reconcile_does_not_mark_active_job_failed_on_status_channel_error(monkeypatch):
+    tmp_path = Path(__file__).resolve().parents[1] / (".test-query-reconcile-error-" + uuid.uuid4().hex)
+    tmp_path.mkdir(parents=True)
+    try:
+        service = FakeService(tmp_path)
+        session = RunningSession()
+        monkeypatch.setenv("CARBON_LENS_JOB_DB", str(tmp_path / "jobs.sqlite3"))
+        monkeypatch.setattr("carbon_lens.jobs.connect", lambda config: session)
+
+        manager = QueryJobManager(lambda: service)
+        queued = manager.submit("test", "SELECT 1", limit=1)
+
+        def failing_connect(config):
+            raise CarbonLensError("SSH connection failed: example: timed out")
+
+        monkeypatch.setattr("carbon_lens.jobs.connect", failing_connect)
+        result = manager.reconcile()
+
+        assert result["active_after"] == 1
+        assert result["errors"][0]["query_id"] == queued["query_id"]
+        assert result["jobs"][0]["status"] == "running"
+        assert "timed out" in result["jobs"][0]["reconcile_error"]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)

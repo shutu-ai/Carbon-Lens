@@ -13,7 +13,9 @@ SSH passwords, private keys, keytabs, or other credentials into the conversation
 ## Workflow
 
 1. Call `carbon_list_connections` and select the named connection. Never infer a
-   connection from a hostname when multiple connections are available.
+   connection from a hostname when multiple connections are available. Then
+   call `carbon_health_check` for a fresh bounded `SELECT 1` probe; the
+   connection list is configuration discovery only, not health evidence.
 2. If the table is unknown, use `carbon_query` with bounded `SHOW DATABASES`,
    `SHOW TABLES`, or `DESCRIBE` SQL. Prefer `carbon_describe` when the table name
    is already known.
@@ -29,34 +31,39 @@ SSH passwords, private keys, keytabs, or other credentials into the conversation
    `carbon_query_status` using the returned `query_id`. Continue until the
    status is `succeeded`, `failed`, or `cancelled`; do not submit the same long
    query again while the first job is still running.
-6. Use `carbon_query_list` and `carbon_query_cancel` for local background job
+6. At the beginning of an active or resumable run, call
+   `carbon_query_reconcile` before interpreting old background-job records.
+   It refreshes active jobs and converges stale jobs whose remote wrapper has
+   timed out or disappeared. A transient status-channel error is a
+   reconciliation error, not proof that the remote query failed.
+7. Use `carbon_query_list` and `carbon_query_cancel` for local background job
    management. These tools do not issue additional Carbon SQL. Background
- tasks are persisted locally and run in detached remote job directories, so
+   tasks are persisted locally and run in detached remote job directories, so
    status can be recovered after an MCP restart. A successful
    status includes the SQL, elapsed time, returned row count, and a three-row
    preview. Completed local task records and saved results are retained for 30
    days. `total_row_count` is null unless the original SQL provides it;
    never add an automatic `COUNT(*)` query.
-7. State the connection, table, time filters, effective row limit, returned row
+8. State the connection, table, time filters, effective row limit, returned row
    count, and whether the result was truncated before interpreting results.
    `total_row_count` is unknown unless the query itself returns an explicitly
    aliased total. Duplicate or empty result columns are preserved with
    deterministic keys such as `id`, `id__2`, and `column_3`; inspect
    `original_columns` and `column_name_map` when the mapping matters.
-8. Use `carbon_export` only when the user requests an export. It supports
+9. Use `carbon_export` only when the user requests an export. It supports
    `format` `csv` or `json`, plus `filename`, `limit`, and `timeout_seconds`.
    The effective row cap is the smaller of the requested `limit` and configured
    `max_rows`. For `SELECT` exports, include an explicit SQL `LIMIT` as well as
    the tool limit. Do not assume the tool limit bounds `SHOW`, `DESCRIBE`, or
    other non-`SELECT` output.
-9. For large or potentially slow file exports, use `carbon_export_start` and
+10. For large or potentially slow file exports, use `carbon_export_start` and
    poll `carbon_export_status` with the returned `export_id`. When the remote
    Carbon export finishes, the status call automatically downloads the file by
    SFTP into `export_dir`; only a completed local download is reported as
    `succeeded`. A download failure remains retryable through the same
    `export_id` and does not rerun the SQL. Use `carbon_export_list` for export
    history and `carbon_export_cancel` to request remote cancellation.
-10. Explain where the exported file will be available. In stdio mode CSV is
+11. Explain where the exported file will be available. In stdio mode CSV is
    generated on the Carbon host and transferred by SFTP to the MCP server's
    configured `export_dir`; JSON is written there from a bounded in-memory
    query. In Streamable HTTP mode, a successful status may include
@@ -66,11 +73,30 @@ SSH passwords, private keys, keytabs, or other credentials into the conversation
    `public_base_url` is configured, use the known MCP server origin plus
    `/exports/{export_id}/download` rather than inventing a host from request
    headers. Do not claim a server-side path is already on the user's device.
-11. For JSON exports, report `truncated` when true and do not present a capped
+12. For JSON exports, report `truncated` when true and do not present a capped
    result as complete. CSV exports report `truncated: "unknown"` when the
    bounded result reaches the effective limit, because an exact cap cannot
    prove that no additional source rows exist. Always report the applied row
    cap and do not treat an unknown result as complete.
+
+### Fresh transport and blocked-state rules
+
+- `carbon_list_connections` proves only that a named configuration exists.
+- A transport-health claim must cite a fresh `carbon_health_check` result or a
+  fresh `carbon_query`/`carbon_query_status` result with its complete ID and
+  timestamp.
+- `result_available=false` and manifest `retryable_failed` are consequences or
+  retry states, not root-cause proof. Do not use them alone to mark Carbon
+  unavailable.
+- A synchronous query that loses its SSH channel has an uncertain remote
+  outcome and must not be blindly resubmitted. Reconcile its background
+  `query_id` when one exists; otherwise classify the task as requiring
+  reconciliation before a duplicate submission.
+- Mark an active stage `blocked` only after three consecutive fresh health
+  probes fail with a transport-level error. An unchanged manifest count is not
+  a health failure.
+- Include `mcp_instance_id`, `query_id`, `created_at`, `finished_at`, and the
+  exact error class when diagnosing multiple MCP instances or stale job DBs.
 
 ## Response display format
 
@@ -97,6 +123,14 @@ user asks for raw output.
 Render a table with `name`, `transport`, `connection_mode`, `host`, and
 `beeline_connection`. Do not show an empty result as a blank table; say
 `没有配置 Carbon 连接`.
+
+#### `carbon_health_check`
+
+Use `health check passed` when `ok=true` and `health check failed` when
+`ok=false`. Show the
+connection, `mcp_instance_id`, probe phase, elapsed time, retryability, and
+the returned error class when present. Never describe a successful connection
+list as a successful health check.
 
 #### `carbon_query`
 
@@ -134,15 +168,22 @@ finished when the status is `queued` or `running`.
 
 Show the total `count` and `returned_count`, followed by a compact table with
 the complete `query_id`, `status`, `connection`, `created_at`, `finished_at`, `elapsed_ms`,
-and `returned_row_count`. Do not put the full SQL into every row; show the SQL
+`returned_row_count`, and `owner_instance_id`. Do not put the full SQL into every row; show the SQL
 only when the user asks for a specific task. Mention that the list is local
-job metadata and does not issue Carbon SQL.
+job metadata and does not issue Carbon SQL. Also show the top-level
+`manager_instance_id` when diagnosing multiple MCP processes.
 
 To inspect one task, call `carbon_query_status` with its complete
 `query_id`. The response contains the original `sql`; a successful task also
 contains `result.columns`, `result.rows`, `returned_row_count`, `preview_rows`,
 and `truncated`. If only a shortened ID is visible, do not guess the rest;
 retrieve the full ID from `carbon_query_list` or ask the user to provide it.
+
+#### `carbon_query_reconcile`
+
+Show the reconciled count, active count before and after, and each complete
+`query_id` that has a reconciliation error or changed terminal state. Poll a
+job with `carbon_query_status` after reconciliation when it remains active.
 
 #### `carbon_query_cancel`
 

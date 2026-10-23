@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import shlex
 from threading import Event
 import time
@@ -15,6 +16,36 @@ from pathlib import Path
 from typing import Any
 
 from .config import CarbonLensError, ConnectionConfig
+
+
+DEFAULT_CONNECT_ATTEMPTS = 2
+MAX_CONNECT_ATTEMPTS = 3
+DEFAULT_CONNECT_BACKOFF_SECONDS = 0.5
+
+
+def _is_retryable_connect_error(exc: BaseException) -> bool:
+    """Return whether a failed SSH setup is safe to retry.
+
+    This deliberately covers connection-establishment failures only.  Once a
+    remote command has started, callers must reconcile its result instead of
+    reconnecting and submitting the command a second time.
+    """
+    text = str(exc).casefold()
+    if any(marker in text for marker in ("authentication", "bad host key", "fingerprint mismatch")):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection refused",
+            "connection was not established",
+            "no valid connections",
+            "error reading ssh protocol banner",
+            "eof",
+        )
+    )
 
 
 def _fingerprint(client: Any) -> str | None:
@@ -79,9 +110,10 @@ def _connect_client(
 
 
 class SSHSession:
-    def __init__(self, client: Any, jump_client: Any = None):
+    def __init__(self, client: Any, jump_client: Any = None, connection_attempts: int = 1):
         self.client = client
         self.jump_client = jump_client
+        self.connection_attempts = max(1, int(connection_attempts))
 
     def upload_text(self, remote_path: str, content: str) -> None:
         try:
@@ -254,13 +286,14 @@ class SSHSession:
         return False
 
 
-def connect(config: ConnectionConfig) -> SSHSession:
+def _connect_once(config: ConnectionConfig) -> SSHSession:
     import paramiko
 
     target = config.ssh
     jump = config.jump
     jump_client = None
     channel = None
+    target_client = None
     try:
         if jump.get("hostname"):
             jump_client = paramiko.SSHClient()
@@ -303,10 +336,65 @@ def connect(config: ConnectionConfig) -> SSHSession:
             _save_host_keys(target_client, config.known_hosts)
         return SSHSession(target_client, jump_client)
     except CarbonLensError:
+        if target_client is not None:
+            target_client.close()
+        if channel is not None:
+            channel.close()
         if jump_client is not None:
             jump_client.close()
         raise
     except Exception as exc:
+        if target_client is not None:
+            target_client.close()
+        if channel is not None:
+            channel.close()
         if jump_client is not None:
             jump_client.close()
         raise CarbonLensError(f"Carbon SSH connection failed: {exc}") from exc
+
+
+def connect(
+    config: ConnectionConfig,
+    *,
+    attempts: int | None = None,
+    backoff_seconds: float | None = None,
+) -> SSHSession:
+    """Establish one Carbon SSH session with bounded setup retries.
+
+    Only transient connection setup errors are retried.  Query execution is
+    intentionally not retried here because a lost channel does not prove that
+    the remote command did not run; long-running work must use the detached
+    query manager and reconcile by query ID.
+    """
+    if attempts is None:
+        try:
+            attempts = int(os.environ.get("CARBON_LENS_SSH_CONNECT_ATTEMPTS", DEFAULT_CONNECT_ATTEMPTS))
+        except (TypeError, ValueError):
+            attempts = DEFAULT_CONNECT_ATTEMPTS
+    attempts = max(1, min(int(attempts), MAX_CONNECT_ATTEMPTS))
+
+    if backoff_seconds is None:
+        try:
+            backoff_seconds = float(
+                os.environ.get("CARBON_LENS_SSH_CONNECT_BACKOFF_SECONDS", DEFAULT_CONNECT_BACKOFF_SECONDS)
+            )
+        except (TypeError, ValueError):
+            backoff_seconds = DEFAULT_CONNECT_BACKOFF_SECONDS
+    backoff_seconds = max(0.0, min(float(backoff_seconds), 30.0))
+
+    last_error: CarbonLensError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            session = _connect_once(config)
+            session.connection_attempts = attempt
+            return session
+        except CarbonLensError as exc:
+            last_error = exc
+            if attempt >= attempts or not _is_retryable_connect_error(exc):
+                raise
+            if backoff_seconds:
+                time.sleep(backoff_seconds * (2 ** (attempt - 1)))
+
+    # The loop always returns or raises, but keep a defensive error for static
+    # type checkers and unusual monkeypatched runtimes.
+    raise last_error or CarbonLensError("Carbon SSH connection failed")

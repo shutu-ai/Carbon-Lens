@@ -76,6 +76,12 @@ def carbon_list_connections() -> list[dict[str, str]]:
 
 
 @app.tool()
+def carbon_health_check(connection: str, timeout_seconds: int | None = None) -> dict[str, Any]:
+    """Run a fresh bounded read-only SSH/Beeline health probe."""
+    return service().health_check(connection, timeout_seconds=timeout_seconds)
+
+
+@app.tool()
 def carbon_workspace_schema_status(connection: str, timeout_seconds: int | None = None) -> dict[str, Any]:
     """Check whether the configured CarbonLens workspace schema exists."""
     return service().workspace_schema_status(connection, timeout_seconds=timeout_seconds)
@@ -127,6 +133,12 @@ def carbon_query_status(query_id: str) -> dict[str, Any]:
 def carbon_query_list(status: str | None = None, limit: int = 50) -> dict[str, Any]:
     """List local background Carbon query jobs without issuing a Carbon query."""
     return query_jobs().list_jobs(status=status, limit=limit)
+
+
+@app.tool()
+def carbon_query_reconcile(limit: int = 50) -> dict[str, Any]:
+    """Refresh active background queries and clean up stale terminal jobs."""
+    return query_jobs().reconcile(limit=limit)
 
 
 @app.tool()

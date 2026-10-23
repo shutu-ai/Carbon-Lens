@@ -55,8 +55,9 @@ python run_mcp.py
 
 Configure Codex to launch that command as a stdio MCP server. Keep
 `CARBON_LENS_CONFIG` in the MCP process environment. The available tools are
-`carbon_list_connections`, `carbon_query`, `carbon_query_start`,
-`carbon_query_status`, `carbon_query_list`, `carbon_query_cancel`,
+`carbon_list_connections`, `carbon_health_check`, `carbon_query`,
+`carbon_query_start`, `carbon_query_status`, `carbon_query_list`,
+`carbon_query_reconcile`, `carbon_query_cancel`,
 `carbon_describe`, `carbon_export`, `carbon_export_start`,
 `carbon_export_status`, `carbon_export_list`, `carbon_export_cancel`,
 `carbon_execute`, `carbon_execute_start`, `carbon_execute_status`,
@@ -110,6 +111,20 @@ bind, set `CARBON_LENS_HTTP_ACCESS_TOKEN` in the service environment, restrict
 `--allowed-host`/`--allowed-origin` as appropriate, and use TLS at the trusted
 reverse proxy or private network boundary.
 
+`carbon_list_connections` only reads connection configuration. Use
+`carbon_health_check` for a fresh read-only `SELECT 1` probe; it reports the
+MCP instance ID, probe phase, elapsed time, retryability, and the error class
+when the SSH/Beeline path is unavailable. The HTTP `/healthz` endpoint is only
+a process check and intentionally does not issue SSH or Carbon SQL.
+
+SSH setup failures that are transient (for example, connect timeout, reset,
+or refusal) are retried with a bounded default of two attempts. Override the
+behavior with `CARBON_LENS_SSH_CONNECT_ATTEMPTS` (maximum three) and
+`CARBON_LENS_SSH_CONNECT_BACKOFF_SECONDS` (maximum 30 seconds). Authentication,
+host-key, and fingerprint failures are not retried. Once a remote command has
+started, CarbonLens does not blindly resubmit it after a lost channel; use
+`carbon_query_start` and reconcile by its `query_id` instead.
+
 Query and export commands use a 10-minute default timeout. Each call may set
 `timeout_seconds` up to 7200 seconds (2 hours); the configured connection value
 in `timeout_seconds` controls the default when the tool argument is omitted.
@@ -146,6 +161,12 @@ result file so list/status metadata does not repeatedly serialize a large
 result into SQLite.
 Set `CARBON_LENS_JOB_DB` to choose another local SQLite path; otherwise the
 database is created beside the configured `config.json`.
+At the beginning of a resumed run, call `carbon_query_reconcile` before
+interpreting old active records. It refreshes active remote jobs, cleans up
+stale terminal state, and reports transient status-channel errors without
+turning an active job into a false failure. Job results include an
+`owner_instance_id`; list and reconcile responses include the current
+`manager_instance_id` so multiple MCP processes can be distinguished.
 
 CSV exports run `fiber-beeline` on the remote host and redirect its output to
 a remote temporary CSV file. CarbonLens downloads that file over SFTP and
